@@ -12,15 +12,18 @@
   always on, and a spec can only add to them. Never make either configurable away.
 - **The store layout is a contract** (Athena tables and IAM policies are written against it):
   `PREFIX/env=/kind=/dt=YYYY-MM-DD/hour=HH/host=/HOST_STAMP_RAND.jsonl.gz`, gzipped JSON lines. Change it only
-  on purpose, with the README. Systems' profiles live beside it at `PREFIX/profiles/system=NAME/` (`profile.json`,
-  `history/`): config without host or folders, the interpreter, the charter, the reviewer's API and its key's
-  variable name, dismissals. Never a secret, never one machine's state.
+  on purpose, with the README. Systems' shared state lives beside it at `PREFIX/systems/system=NAME/`.
 - **Nothing leaves a host unredacted.** Redaction runs before templating, samples, raw, answers and discovery
   samples. A new output path goes through the interpreter's `redact` too. Discovery lists config files, never
   reads them out; watched files are hashed, never sent.
 - **The reviewer has no credentials and no network.** `ridge sync` (the plain loop) talks to the store;
   `ridge watch` and everything the hobkin runs read and write only the ridge's data folder. Asks to eaves are
   a fixed menu (`lines`, `inventory`, `flows`): never add one that runs a command it's given.
+- **Nodes can drop out at any moment.** What a system knows lives in its shared state in the store, never only
+  on one node. Writes that two nodes could make at once are conditional (create-if-absent, update-if-unchanged:
+  `Conflict`), or one object per event (the ledger) so nothing is overwritten. The ridge is a lease, not a box;
+  review jobs go to the host their evidence came from, and claims run out when a node dies. Test any change
+  with nodes that stop mid-way.
 - **People are reached through one queue** (`DATA/notify/queue/`), sent by the plain loop (sendmail or SMTP,
   capped per hour): fired alerts, the reviewer's notes, hobkin's own alerts. The reviewer only writes the queue
   (it has no network). Alert rules are spec data checked by plain code each tick, never a model call.

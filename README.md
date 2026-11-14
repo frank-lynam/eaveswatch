@@ -99,48 +99,81 @@ Discovery runs again every hour. What changed (new units, programs,
 listeners, logs written but not collected) comes in its digest. It fixes and
 narrows the interpreter on its own, and asks you before adding a source.
 
-IAM for a finial: `s3:PutObject` on `PREFIX/*/host=HOST/*`, plus read and write
-on its system's profile (`PREFIX/profiles/system=NAME/*`). `eaveswatch iam`
-prints that exact policy for this box. If the credentials can
+IAM for a node: write its own host's data and asks, read, write and delete its
+system's shared state (`PREFIX/systems/system=NAME/*`), and read its
+environment's data, because any node may hold the ridge duty. `eaveswatch iam`
+prints that exact policy for this box. Within one system's nodes that's one
+trust boundary; separate systems stay apart. If the credentials can
 do far more (an instance profile with full S3 access, say), `check` says so,
 and the reviewer raises it at setup.
 
-## An autoscaling group: profiles
+## A system of several nodes (an autoscaling group)
 
-Each system's setup lives in the store, so a new instance sets itself up with
-nothing asked:
+Every instance runs the same thing. There's no hub to deploy, and any node can
+drop out at any moment without the system losing anything, because what the
+system knows lives in the store:
 
 ```
-PREFIX/profiles/system=ps-hr-app/profile.json                 the latest
-PREFIX/profiles/system=ps-hr-app/history/profile_STAMP_RAND.json   every version before it
+PREFIX/systems/system=ps-hr-app/
+  config.json          the shared config and the reviewer's model API (its key's variable name, never the key)
+  interpreter/vN.json  every version: a node creates vN only if no other node has (the loser is told)
+  charter.md           the reviewer's REVIEW.md
+  ledger/              findings events, one object each, never overwritten: every node folds the same events
+  alerts/  sent/       fired alerts; notes already sent (once for the system, however many nodes saw it)
+  nodes/HOST.json      heartbeats          lease/ridge.json   who does the ridge duty
+  jobs/ID.json         review jobs         state/map.json     the merged map, for every node's page
 ```
 
-- **What's in it:** the config, minus the host and this machine's folders; the
-  active interpreter, with its alert rules; the reviewer's charter
-  (`REVIEW.md`); the reviewer's model API and the *name* of the environment
-  variable that holds its key; and the dismissed findings with their reasons.
-  Never a secret, and never one machine's state (offsets, baselines, the map).
-- **Saved by itself:** the loop saves it whenever it changes (a new interpreter,
-  an edited charter, a dismissal). `eaveswatch save` does it now.
-- **Restored by one command** from an instance's user-data
-  ([examples/asg/user-data.sh](examples/asg/user-data.sh)):
+- **The ridge is a duty, not a box.** One node holds a lease (S3's
+  conditional writes, renewed every tick, taken over when it runs out). The
+  ridge duty is plain code with no model:
+  - merge every node's data into the map
+  - spot what's new across the fleet: a template seen nowhere before, a
+    deploy, a config change, a new host, new connections
+  - notice nodes that went silent without saying they were leaving (a warning,
+    sent once, and a job)
+  - turn all of that into **review jobs**
+- **Reviews go where the evidence is.** A job names the host its evidence came
+  from, and that host's reviewer claims it first (it has the logs, the
+  processes and the code right there). If it doesn't within
+  `job_wait_seconds`, because it's dead or busy, any node takes it. Claims are
+  renewed while the reviewer works and run out if its node dies, so the job goes
+  back to the others. Alerts come first: a node gives back a routine review to
+  take one.
+- **Each node's reviewer is woken only by the job it holds** (`eaveswatch
+  watch`). Idle nodes cost nothing. The reviewer finishes with `eaveswatch job
+  done ID --note "..."`, or gives a job back with `job release ID`.
+- **Everything spreads within a minute:** findings recorded on any node,
+  dismissals, the interpreter applied anywhere, the charter. **Every node renders
+  the findings page** from the shared state, so a load balancer can send you to
+  any of them.
+- **An alert is emailed once for the system:** the first node to create its
+  `sent/` record sends it. A failed unit is per host; an error storm seen by ten
+  nodes is one email.
+- **Asks** between nodes go through the store, and the answer comes back to the
+  reviewer that asked.
+- **A clean stop** (scale-in, shutdown) marks the node as left, gives the lease
+  and its job back, and isn't reported as gone.
 
-  ```sh
-  eaveswatch restore s3://my-eaves-bucket/eaveswatch ps-hr-app
-  ```
+Set the first node up with `eaveswatch URL MODEL --system ps-hr-app`. It shares
+the system's config. Every later instance joins from its user-data, with no
+questions ([examples/asg/user-data.sh](examples/asg/user-data.sh)):
 
-  It writes the config with this instance's own host, installs the interpreter
-  (validated but not replayed, since the services may still be starting),
-  writes the charter, keeps dismissed findings dismissed, runs `check`,
-  starts the user service, and starts the reviewer with its key from
-  `$EAVESWATCH_MODEL_KEY` (or whichever variable the profile names). No chat,
-  since nobody's there. The reviewer sees it was restored, checks the setup
-  against this box, fixes what differs, and tells you.
-- **Set the first instance up with `--system NAME`**, the name every instance
-  of the group shares. It defaults to the hostname, which an ASG doesn't keep.
-  `--key-env` names the variable new instances will find the key in.
-- hobkin keeps the key it's given in its own key file, readable only by that
-  user. AWS credentials come from the instance profile.
+```sh
+eaveswatch join s3://my-eaves-bucket/eaveswatch ps-hr-app
+```
+
+It writes this instance's config (its own host), and on its first tick pulls
+the interpreter, alert rules, charter and findings. It runs `check`, starts the
+user service, and starts the reviewer with its key from `$EAVESWATCH_MODEL_KEY`
+(or the variable the system names) and no chat. `--no-reviewer` makes a
+collector-only node, which shares data but never leads or reviews. hobkin keeps
+the key it's given in its own key file, readable only by that user. AWS
+credentials come from the instance profile.
+
+`cluster` in the config tunes the timings: `lease_seconds` (180),
+`claim_seconds` (600), `job_wait_seconds` (120), `node_gone_seconds` (300),
+`job_keep_days` (7).
 
 ## Alerts and the findings page
 
@@ -220,8 +253,8 @@ PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=ps-hr-01/ps-hr-01_202611
   - `requests` and `answers`: asks
   - `alerts`: what fired, and why
   - `check`: probes, which a lifecycle rule can expire
-- **Profiles** sit beside the data, at `PREFIX/profiles/system=NAME/` (see
-  "An autoscaling group").
+- **Systems' shared state** sits beside the data, at
+  `PREFIX/systems/system=NAME/` (see "A system of several nodes").
 - **Nothing is lost when the store is away.** Every file is spooled to disk
   before the eave saves its place in the logs, then sent oldest first. Past
   `spool_max_mb` the oldest `raw` files go first, and the gap is reported
@@ -296,7 +329,8 @@ Plumbing only; what to collect is the interpreter's.
 | `role` | `eave` | `eave`, `ridge` or `finial` |
 | `env` | `prod` | the `env=` prefix |
 | `host` | hostname | the `host=` prefix |
-| `system` | host | the name instances of one system share (an ASG's): its profile in the store |
+| `system` | host | the name a system's nodes share (an ASG's): its shared state in the store |
+| `cluster` | | a system's timings: `lease_seconds`, `claim_seconds`, `job_wait_seconds`, `node_gone_seconds`, `job_keep_days` |
 | `store` | | a folder, or `s3://bucket/prefix` |
 | `region`, `endpoint` | `$AWS_REGION` | S3 region; an S3-compatible endpoint (path-style) |
 | `state_dir` | `/var/lib/eaveswatch` | offsets, cursors, baselines, the spool; the ridge's data default |

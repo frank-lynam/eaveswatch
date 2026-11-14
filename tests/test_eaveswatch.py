@@ -280,13 +280,14 @@ o_back = cli("--config", cfgp, "interpret", "rollback")
 check("[interpret] init writes the starter; test replays real lines; apply numbers versions and says what changed",
       o_init.returncode == 0 and o_test.returncode == 0 and "appsrv (files, 2 files): 10 lines" in o_test.stdout
       and "applied v1" in o_apply.stdout and "applied v2 (was v1):\n  + source other" in o_apply2.stdout, o_test.stdout + o_apply2.stdout)
-check("[interpret] show lists the active sources and the history; rollback goes back to the one before",
+check("[interpret] show lists the active sources and the history; rollback makes the old spec a new version (so it spreads)",
       "interpreter: v2" in o_show.stdout and "other:" in o_show.stdout and "apply v1: first" in o_show.stdout
-      and "active: v1 (was v2)" in o_back.stdout and ew.active_spec(icfg)[1] == 1, o_show.stdout + o_back.stdout)
+      and "active: v3, v1's spec again (was v2)" in o_back.stdout and ew.active_spec(icfg)[1] == 3
+      and len(ew.active_spec(icfg)[0]["sources"]) == 1, o_show.stdout + o_back.stdout)
 bad = dict(spec, sources=[{"name": "x", "path": "~/.ssh/id_rsa"}])
 o_bad = cli("--config", cfgp, "interpret", "apply", spec_file(bad, tempfile.mkdtemp()))
 check("[interpret] a spec pointing at credentials isn't applied", o_bad.returncode != 0 and "never collected" in o_bad.stderr
-      and ew.active_spec(icfg)[1] == 1, o_bad.stderr)
+      and ew.active_spec(icfg)[1] == 3, o_bad.stderr)
 write(os.path.join(dbase, "evil.log"), ["a" * 30 + "b"] * 3)
 evil = dict(spec, sources=[{"name": "evil", "path": os.path.join(dbase, "evil.log"), "placeholders": [{"name": "x", "pattern": "(a+)+$"}]}])
 t0 = time.time()
@@ -314,15 +315,26 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
 
     deny_put = False
 
+    def do_DELETE(self):
+        self.verify()
+        FakeS3.objects.pop(urllib.parse.unquote(urllib.parse.urlsplit(self.path).path), None)
+        self.send_response(204); self.end_headers()
+
     def do_PUT(self):
         body = self.rfile.read(int(self.headers["content-length"]))
         self.verify(body)
+        path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        cur = FakeS3.objects.get(path)
+        inm, im = self.headers.get("If-None-Match"), self.headers.get("If-Match")
+        if (inm == "*" and cur is not None) or (im and (cur is None or im.strip('"') != hashlib.md5(cur).hexdigest())):
+            self.send_response(412); self.send_header("content-length", "0"); self.end_headers()
+            return
         if FakeS3.deny_put:
             err = b"<?xml version='1.0'?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
             self.send_response(403); self.send_header("content-length", str(len(err))); self.end_headers(); self.wfile.write(err)
             return
-        FakeS3.objects[urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)] = body
-        self.send_response(200); self.end_headers()
+        FakeS3.objects[path] = body
+        self.send_response(200); self.send_header("ETag", f'"{hashlib.md5(body).hexdigest()}"'); self.end_headers()
 
     def do_GET(self):
         self.verify()
@@ -345,7 +357,8 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
             body = FakeS3.objects.get(urllib.parse.unquote(u.path))
             if body is None:
                 self.send_response(404); self.end_headers(); return
-        self.send_response(200); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.send_response(200); self.send_header("content-length", str(len(body)))
+        self.send_header("ETag", f'"{hashlib.md5(body).hexdigest()}"'); self.end_headers(); self.wfile.write(body)
 
 
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeS3)
@@ -367,9 +380,9 @@ check("[check] an eave on S3: credentials (key masked), a probe under its own ho
 FakeS3.deny_put = True
 text, problems = ew.run_check(s3cfg, "test.json", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
 FakeS3.deny_put = False
-check("[check] S3 refusing says S3's own reason and the permission to add (its files, and its system's profile)",
+check("[check] S3 refusing says S3's own reason and the permission to add (its files, and its system's shared state)",
       problems == 2 and "FAIL  store: write: 403 AccessDenied: Access Denied" in text
-      and "fix: allow s3:GetObject and s3:PutObject on s3://bucket/eaves/v1/profiles/system=web-7/*" in text
+      and "s3:DeleteObject on s3://bucket/eaves/v1/systems/system=web-7/*" in text
       and "fix: allow s3:PutObject on s3://bucket/eaves/v1/*/host=web-7/*" in text, text)
 rd_text, rd_problems = ew.run_check({**s3cfg, "role": "ridge"}, "test.json", s3)
 check("[check] a ridge on S3: lists and reads each kind it syncs", rd_problems == 0
@@ -522,8 +535,8 @@ check("[check] a finial only writes to the store (its asks and ridge are local):
 o_fin = cli("--config", os.path.join(dd, "fcfg.json"), "finial", "--once") if json.dump(
     {"store": fcfg["store"], "env": "test", "host": "box", "role": "finial", "state_dir": fcfg["state_dir"]},
     open(os.path.join(dd, "fcfg.json"), "w")) is None else None
-check("[finial] eaveswatch finial --once: a tick, a look, the spool sent", o_fin.returncode == 0 and "discovered" in o_fin.stdout
-      and "sent" in o_fin.stdout, o_fin.stdout + o_fin.stderr)
+check("[finial] eaveswatch finial --once: a node's tick (the ridge duty, a job for what discovery saw), the spool sent",
+      o_fin.returncode == 0 and "this node took the ridge duty" in o_fin.stdout and "sent " in o_fin.stdout, o_fin.stdout + o_fin.stderr)
 
 # ---- findings
 cfg = cfgs["web-1"]
@@ -573,7 +586,7 @@ cj = json.load(open(os.path.join(chores, "eaveswatch", "chore.json"))) if out.re
 md = open(os.path.join(chores, "eaveswatch", "CHORE.md")).read() if out.returncode == 0 else ""
 check("[chore] eaveswatch chore writes the reviewer chore: its full command path, a quiet watch, safe mode writing only data, "
       "setup with the human",
-      cj.get("name") == "eaveswatch" and cj["config"]["wake"]["command"] == "{{command}} --config {{config}} ridge watch"
+      cj.get("name") == "eaveswatch" and cj["config"]["wake"]["command"] == "{{command}} --config {{config}} watch"
       and os.path.isabs(cj["settings"]["command"]["default"].split()[0]) and "eaveswatch" in cj["settings"]["command"]["default"]
       and "{{command}} --config {{config}} discover" in md
       and cj["config"]["safe_mode"] == {"write": ["{{data}}"]} and "## Setting up" in md and "Ask your human, once" in md
@@ -738,10 +751,12 @@ json.dump({"store": "s3://my-bucket/eaveswatch", "env": "prod", "host": "ps1", "
            "state_dir": os.path.join(ab, "iam")}, open(iam_path, "w"))
 oi = cli("--config", iam_path, "iam")
 pol = json.loads(oi.stdout) if oi.returncode == 0 else {}
-check("[iam] the least a finial needs: write under its own host, read and write its system's profile",
-      [st["Sid"] for st in pol.get("Statement", [])] == ["WriteOwnHost", "SystemProfile"]
-      and pol["Statement"][0]["Resource"] == "arn:aws:s3:::my-bucket/eaveswatch/*/host=ps1/*"
-      and pol["Statement"][1]["Resource"] == "arn:aws:s3:::my-bucket/eaveswatch/profiles/system=ps-hr/*", oi.stdout)
+sids = {st["Sid"]: st for st in pol.get("Statement", [])}
+check("[iam] a node: write its own host's data, the system's shared state, and read its environment's data (any node may hold the ridge)",
+      set(sids) == {"WriteOwnHost", "SystemState", "List", "ReadAsksAndAnswers", "RidgeDutyReads"}
+      and "arn:aws:s3:::my-bucket/eaveswatch/*/host=ps1/*" in sids["WriteOwnHost"]["Resource"]
+      and sids["SystemState"]["Resource"] == "arn:aws:s3:::my-bucket/eaveswatch/systems/system=ps-hr/*"
+      and "s3:DeleteObject" in sids["SystemState"]["Action"], oi.stdout)
 check("[iam] a folder store needs no policy, and says so", "no IAM policy needed" in cli("--config", acfg_path, "iam").stderr)
 s3f = ew.make_config({"store": "s3://bucket/eaves/v1", "env": "test", "host": "ps9", "role": "finial", "state_dir": tempfile.mkdtemp()})
 btext, _ = ew.run_check(s3f, "x", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
@@ -771,74 +786,163 @@ check("[setup] where alerts go and the web folder for the findings page, from fl
       and c5.get("publish", {}).get("dir") == os.path.join(sh2, "www")
       and "anyone who can reach that site sees the findings" in o5.stdout, o5.stdout + o5.stderr)
 
-# ---- profiles: a system's setup saved in the store, restored on a new instance from its environment
-pb = tempfile.mkdtemp(prefix="eaveswatch-profile-")
-pstore = os.path.join(pb, "store")
-pcfg_path = os.path.join(pb, "a.json")
-json.dump({"role": "finial", "env": "test", "host": "ip-10-0-1-5", "system": "ps-hr-app", "store": pstore,
-           "state_dir": os.path.join(pb, "a"), "notify": {"email": "me@example.test", "smtp": f"127.0.0.1:{smtp.server_address[1]}"}},
-          open(pcfg_path, "w"))
-pcfg = ew.load_config(pcfg_path)
-plog = os.path.join(pb, "APPSRV_1114.LOG")
-write(plog, ["PSAPPSRV.1 (3) started"])
-pspec = {"sources": [{"name": "appsrv", "path": os.path.join(pb, "APPSRV_*.LOG")}],
-         "alerts": [{"name": "unit", "unit_failed": ["psappsrv.service"], "severity": "page"}], "warmup_minutes": 0}
-ew.apply_spec(pcfg, spec_file(pspec, pb), "first")
-os.makedirs(pcfg["ridge"]["data"], exist_ok=True)
-open(os.path.join(pcfg["ridge"]["data"], "REVIEW.md"), "w").write("# PeopleSoft HR\nSign-on failures matter.\n")
-ew.write_json(os.path.join(pcfg["ridge"]["data"], "reviewer.json"), {"url": "https://api.example.test/v1", "model": "m",
-                                                                     "key_env": "EAVESWATCH_MODEL_KEY"})
-dis = {"category": "security/exposure", "location": "pia :8000", "claim": "c", "evidence": "e", "scenario": "s", "action": "a",
-       "confidence": "low"}
-fid = ew.finding_add(pcfg, dis).split()[0]
-ew.finding_status(pcfg, fid, "dismissed", "internal only, behind the ALB")
-k1 = ew.save_profile(pcfg, pcfg_path)
-prof = json.loads(ew.FolderStore(pstore).get("profiles/system=ps-hr-app/profile.json"))
-check("[profile] saved to the store: config (not the host or its folders), interpreter and alert rules, charter, reviewer (no key), dismissals",
-      k1 == "profiles/system=ps-hr-app/profile.json" and "host" not in prof["config"] and "state_dir" not in prof["config"] and prof["config"]["system"] == "ps-hr-app"
-      and prof["interpreter"]["spec"]["alerts"][0]["name"] == "unit" and "Sign-on failures" in prof["charter"]
-      and prof["reviewer"] == {"url": "https://api.example.test/v1", "model": "m", "key_env": "EAVESWATCH_MODEL_KEY"}
-      and prof["dismissed"][0]["why"] == "internal only, behind the ALB" and "sk-" not in json.dumps(prof), prof)
-check("[profile] unchanged, it isn't saved again", ew.save_profile(pcfg, pcfg_path) is None)
-ew.apply_spec(pcfg, spec_file({**pspec, "about": "v2"}, pb), "second")
-ew.save_profile(pcfg, pcfg_path)
-hist = ew.FolderStore(pstore).list("profiles/system=ps-hr-app/history/")
-check("[profile] a change (a new interpreter) saves again, the old version kept in history", len(hist) == 2, hist)
-check("[iam] a finial may read and write its system's profile, and nothing else of the store's but its own host",
-      any(st["Sid"] == "SystemProfile" and st["Resource"].endswith("profiles/system=ps-hr-app/*") for st in ew.iam_policy(pcfg)["Statement"]))
-# a new instance: no questions, the key from the environment
-nb = tempfile.mkdtemp(prefix="eaveswatch-restore-")
-open(os.path.join(nb, "fake_hobkin.py"), "w").write("import json,sys; json.dump(sys.argv[1:], open(sys.argv[0] + '.out', 'w'))")
-renv = {**os.environ, "HOME": nb, "HOBKIN_HOME": os.path.join(nb, ".hobkins"), "EAVESWATCH_MODEL_KEY": "sk-from-env",
-        "EAVESWATCH_HOBKIN": f"{sys.executable} {os.path.join(nb, 'fake_hobkin.py')}"}
-r1 = subprocess.run([sys.executable, EW, "restore", pstore, "ps-hr-app", "--no-service", "--host", "ip-10-0-2-9"],
-                    capture_output=True, text=True, env=renv, stdin=subprocess.DEVNULL)
-real_home, os.environ["HOME"] = os.environ.get("HOME"), nb          # its config's ~ is that instance's home
-ncfg = ew.load_config(os.path.join(nb, ".config", "eaveswatch", "finial.json")) if r1.returncode == 0 else None
+# ---- a cluster: three nodes of one system on a shared store; any of them can drop out
+cb = tempfile.mkdtemp(prefix="eaveswatch-cluster-")
+cstore = os.path.join(cb, "store")
+clog = os.path.join(cb, "app.log")
+open(clog, "w").close()
+cmail = os.path.join(cb, "mail.txt")
+csend = os.path.join(cb, "sendmail")
+open(csend, "w").write(f"#!/bin/sh\ncat >> {cmail}\necho '----' >> {cmail}\n")
+os.chmod(csend, 0o755)
+FAST = {"lease_seconds": 2, "claim_seconds": 3, "job_wait_seconds": 1, "node_gone_seconds": 3}
+
+
+def node_cfg(host, store=cstore):
+    path = os.path.join(cb, f"{host}.json")
+    json.dump({"role": "finial", "env": "test", "host": host, "system": "ps", "store": store, "cluster": FAST,
+               "state_dir": os.path.join(cb, host), "publish": {"dir": os.path.join(cb, "www", host)},
+               "notify": {"email": "me@example.test", "sendmail": csend, "per_hour": 50}}, open(path, "w"))
+    os.makedirs(os.path.join(cb, "www", host), exist_ok=True)
+    return ew.load_config(path), path
+
+
+c1, c1p = node_cfg("n1")
+c2, _ = node_cfg("n2")
+c3, _ = node_cfg("n3")
+ew.apply_spec(c1, spec_file({"sources": [{"name": "app", "path": clog}], "warmup_minutes": 0, "alerts": [
+    {"name": "storm", "severity": "page", "match": {"template": "connection refused", "count": 2, "minutes": 5}},
+    {"name": "unit", "unit_failed": ["psappsrv.service"]}]}, cb), "first")
+n1, n2, n3 = ew.Node(c1), ew.Node(c2), ew.Node(c3)
+for n in (n1, n2, n3):
+    n.eave.failed_units = lambda: set()
+    n.eave.state["started"] = "2020-01-01T00:00:00Z"
+said1 = n1.tick()
+n2.tick(); n3.tick()
+check("[cluster] one node holds the ridge duty; the others don't",
+      n1.leading and not n2.leading and not n3.leading and "this node took the ridge duty" in said1, said1)
+check("[cluster] the interpreter applied on one node reaches the others",
+      ew.active_spec(c2)[1] == 1 and ew.active_spec(c3)[1] == 1 and ew.active_spec(c3)[0].get("alerts"),
+      (ew.active_spec(c2)[1], ew.active_spec(c3)[1]))
+open(os.path.join(c1["ridge"]["data"], "REVIEW.md"), "w").write("# The PS system\nSign-on failures matter.\n")
+n1.tick(); n2.tick()
+check("[cluster] the charter edited on one node reaches the others",
+      "Sign-on failures" in ew._read(os.path.join(c2["ridge"]["data"], "REVIEW.md")))
+# findings: recorded anywhere, on every node's page
+cf = {"category": "security/authn", "location": "pia signon", "claim": "sign-on failures from one address <b>",
+      "evidence": "e", "scenario": "s", "action": "a", "confidence": "medium"}
+cfid = ew.finding_add(c2, cf).split()[0]
+n2.tick(); n3.tick(); n1.tick()
+page3 = open(os.path.join(cb, "www", "n3", "index.html")).read()
+check("[cluster] a finding recorded on one node is on every node's page (behind a load balancer, any node answers)",
+      cfid in ew.findings(c1) and cfid in ew.findings(c3) and "sign-on failures from one address &lt;b&gt;" in page3)
+ew.finding_add(c3, {**cf, "evidence": "more, from n3"})
+ew.finding_status(c1, cfid, "dismissed", "a load-test address")
+for n in (n3, n1, n2, n3, n1):
+    n.tick()
+f1, f3 = ew.findings(c1)[cfid], ew.findings(c3)[cfid]
+check("[cluster] the same finding from two nodes is one, seen twice; a dismissal anywhere holds everywhere",
+      f1["status"] == f3["status"] == "dismissed" and f1["sightings"] == f3["sightings"] == 2, (f1, f3))
+# an alert where the evidence is: the job goes to that node, one email for the system
+n2.eave.failed_units = lambda: {"psappsrv.service"}
+said2 = n2.tick()
+n1.tick(); n3.tick()
+cst = ew.FolderStore(cstore)
+aj = [j for j in (ew.jget(cst, k)[0] for k in cst.list(ew.sys_key(c2, "jobs") + "/")) if j["title"].startswith("alert unit on n2")]
+check("[cluster] an alert on n2: a job naming n2, claimed by n2 (not the others), and its reviewer woken with it",
+      aj and (aj[0].get("claim") or {}).get("host") == "n2" and n2.st.get("active") == aj[0]["id"]
+      and n1.st.get("active") != aj[0]["id"] and n3.st.get("active") != aj[0]["id"]
+      and "# Review job" in ew.node_watch(c2) and ew.node_watch(c2) == "", (said2, aj))
+write(clog, ["ERROR connection refused to db:1521"] * 3)
+n1.tick(); n3.tick(); n2.tick()
+mail = open(cmail).read() if os.path.exists(cmail) else ""
+check("[cluster] the same error storm seen by two nodes: one email for the system, not two",
+      len(re.findall(r"Subject: \[ALERT\] n\d: storm", mail)) == 1
+      and mail.count("unit: psappsrv.service has failed") == 1, mail.count("----"))
+# the reviewer says it's done: the system knows
+jid = aj[0]["id"]
+ew.write_json(os.path.join(c2["ridge"]["data"], "jobs", "done", f"{jid}.json"), {"note": "PSAPPSRV restarted by ops"})
+n2.tick()
+j_now, _ = ew.jget(ew.FolderStore(cstore), ew.sys_key(c2, "jobs", f"{jid}.json"))
+n1.tick()
+check("[cluster] a job done on its node is done for the system, with the reviewer's note, on the page",
+      j_now["done"]["note"] == "PSAPPSRV restarted by ops" and n2.st.get("active") != jid
+      and "done on n2: PSAPPSRV restarted by ops" in open(os.path.join(cb, "www", "n1", "index.html")).read(), j_now)
+# a job whose node dies is taken by another once its claim runs out
+jx = n3.make_job("test:dies-with-n3", "evidence on n3", "n3", "look at n3", priority=0)
+n3.tick()
+check("[cluster] n3 claims its own job", (n3.st.get("active") or "") in (jx or ""), n3.st)
+jx_id = jx.split()[1].rstrip(":") if jx else ""
+end = time.time() + 4.5                                 # n3 is gone: no ticks, no renewals; the others carry on,
+while time.time() < end:                                # their reviewers finishing what they had
+    for n in (n1, n2):
+        if n.st.get("active") and n.st["active"] != jx_id:
+            ew.write_json(os.path.join(n.data, "jobs", "done", f"{n.st['active']}.json"), {"note": "done"})
+        n.tick()
+taken = [n.host for n in (n1, n2) if n.st.get("active") and n.st["active"] in (jx or "")]
+check("[cluster] n3 dies mid-review: its claim runs out and another node takes the job", taken, (n1.st, n2.st))
+gone_mail = open(cmail).read()
+check("[cluster] the node holding the ridge notices n3 went silent: one warning, and a job",
+      "node n3 is gone" in gone_mail and gone_mail.count("node n3 is gone") == 1, gone_mail[-600:])
+# the ridge holder leaves cleanly: another takes over at once
+n1.leave()
+said_n2 = n2.tick()
+check("[cluster] the ridge holder leaves cleanly (scale-in): the lease is given back and another node takes it",
+      n2.leading and any("took the ridge duty" in x for x in said_n2), said_n2)
+hb1, _ = ew.jget(ew.FolderStore(cstore), ew.sys_key(c1, "nodes", "n1.json"))
+time.sleep(3.2)
+n2.tick()
+check("[cluster] a node that said it was leaving isn't reported as gone", hb1.get("left")
+      and "node n1 is gone" not in open(cmail).read())
+# two nodes apply an interpreter at the same moment: one wins, the other is told
+n3 = ew.Node(c3)
+ew.apply_spec(c2, spec_file({"sources": [{"name": "app", "path": clog}], "about": "from n2"}, cb), "n2's")
+ew.apply_spec(c3, spec_file({"sources": [{"name": "app", "path": clog}], "about": "from n3"}, cb), "n3's")
+n2.tick(); n3.tick()
+note3 = ew.node_watch(c3)
+check("[cluster] two interpreters at once: the first shared stands everywhere; the other node's reviewer is told",
+      ew.active_spec(c3)[0].get("about") == "from n2" and "lost a race" in note3
+      and os.path.exists(os.path.join(c3["interpreter"], "v2.lost.json")), (ew.active_spec(c3)[0].get("about"), note3[:200]))
+# asks between nodes: n2's reviewer asks n3; n3 answers through the store; n2 hears back
+ew.Ridge(c2).ask("n3", "inventory")
+n2.tick(); n3.tick(); n2.tick()
+w2 = ew.node_watch(c2)
+check("[cluster] an ask to another node is answered through the store, back to the reviewer who asked",
+      "an answer from n3" in w2 and '"inventory"' in w2, w2[:300])
+# a new instance joins: no questions, the rest on its first tick
+ew.write_json(os.path.join(c1["ridge"]["data"], "reviewer.json"), {"url": "https://api.example.test/v1", "model": "m",
+                                                                   "key_env": "EAVESWATCH_MODEL_KEY"})
+ew.share_config(c1, c1p)
+jb = tempfile.mkdtemp(prefix="eaveswatch-join-")
+open(os.path.join(jb, "fake_hobkin.py"), "w").write("import json,sys; json.dump(sys.argv[1:], open(sys.argv[0] + '.out', 'w'))")
+jenv = {**os.environ, "HOME": jb, "HOBKIN_HOME": os.path.join(jb, ".hobkins"), "EAVESWATCH_MODEL_KEY": "sk-from-env",
+        "EAVESWATCH_HOBKIN": f"{sys.executable} {os.path.join(jb, 'fake_hobkin.py')}"}
+jr = subprocess.run([sys.executable, EW, "join", cstore, "ps", "--no-service", "--host", "n4"], capture_output=True, text=True,
+                    env=jenv, stdin=subprocess.DEVNULL)
+real_home, os.environ["HOME"] = os.environ.get("HOME"), jb
+c4 = ew.load_config(os.path.join(jb, ".config", "eaveswatch", "finial.json")) if jr.returncode == 0 else None
 os.environ["HOME"] = real_home
-hargs = json.load(open(os.path.join(nb, "fake_hobkin.py.out"))) if os.path.exists(os.path.join(nb, "fake_hobkin.py.out")) else []
-check("[restore] a new instance sets itself up from the profile: its own host, the system's interpreter, alerts and charter",
-      ncfg and ncfg["host"] == "ip-10-0-2-9" and ncfg["system"] == "ps-hr-app" and ncfg["notify"]["email"] == "me@example.test"
-      and ncfg["state_dir"] == os.path.join(nb, "eaveswatch")
-      and ew.active_spec(ncfg)[0].get("about") == "v2" and ew.active_spec(ncfg)[1] == 1
-      and "Sign-on failures" in open(os.path.join(ncfg["ridge"]["data"], "REVIEW.md")).read()
-      and os.path.exists(os.path.join(ncfg["ridge"]["data"], "restored.json")), r1.stdout + r1.stderr)
-check("[restore] dismissed stays dismissed on the new instance", ncfg and "was dismissed (internal only, behind the ALB)"
-      in ew.finding_add(ncfg, dis))
-check("[restore] the reviewer starts with its key from the environment, and no chat (nobody's there)",
-      hargs[:3] == ["https://api.example.test/v1", "m", "sk-from-env"] and "--chore" in hargs and "--chat" not in hargs
-      and "--no-service" in hargs, hargs)
-r2 = subprocess.run([sys.executable, EW, "restore", pstore, "ps-hr-app", "--no-service"], capture_output=True, text=True,
-                    env=renv, stdin=subprocess.DEVNULL)
-check("[restore] a box already set up isn't overwritten without --force", r2.returncode != 0 and "--force" in r2.stderr, r2.stderr)
-nb2 = tempfile.mkdtemp(prefix="eaveswatch-restore2-")
-r3 = subprocess.run([sys.executable, EW, "restore", pstore, "ps-hr-app", "--no-service"], capture_output=True, text=True,
-                    env={**renv, "HOME": nb2, "EAVESWATCH_MODEL_KEY": ""}, stdin=subprocess.DEVNULL)
-check("[restore] without the key in the environment, it says which variable to set",
-      r3.returncode != 0 and "$EAVESWATCH_MODEL_KEY" in r3.stderr, r3.stderr)
-r4 = subprocess.run([sys.executable, EW, "restore", pstore, "no-such-system", "--no-service"], capture_output=True, text=True,
-                    env={**renv, "HOME": tempfile.mkdtemp()}, stdin=subprocess.DEVNULL)
-check("[restore] no profile for that system: it says how one gets made", r4.returncode != 0 and "--system NAME" in r4.stderr, r4.stderr)
+hargs = json.load(open(os.path.join(jb, "fake_hobkin.py.out"))) if os.path.exists(os.path.join(jb, "fake_hobkin.py.out")) else []
+check("[join] a new instance joins with no questions: its own host, the system's interpreter, charter and findings on its first tick",
+      c4 and c4["host"] == "n4" and c4["system"] == "ps" and ew.active_spec(c4)[0].get("about") == "from n2"
+      and "Sign-on failures" in ew._read(os.path.join(c4["ridge"]["data"], "REVIEW.md")) and cfid in ew.findings(c4),
+      jr.stdout + jr.stderr)
+check("[join] its reviewer starts with the key from the environment, and no chat (nobody's there)",
+      hargs[:3] == ["https://api.example.test/v1", "m", "sk-from-env"] and "--chat" not in hargs and "--no-service" in hargs, hargs)
+jr2 = subprocess.run([sys.executable, EW, "join", cstore, "nope", "--no-service"], capture_output=True, text=True,
+                     env={**jenv, "HOME": tempfile.mkdtemp()}, stdin=subprocess.DEVNULL)
+check("[join] no such system: it says how one starts", jr2.returncode != 0 and "--system nope" in jr2.stderr, jr2.stderr)
+# the same lease and claims against S3's conditional writes (the fake checks If-None-Match and If-Match)
+s3a, _ = node_cfg("s3a", "s3://bucket/eaves/v1")
+s3b, _ = node_cfg("s3b", "s3://bucket/eaves/v1")
+for c in (s3a, s3b):
+    c["endpoint"] = f"http://127.0.0.1:{srv.server_port}"
+na, nb = ew.Node(s3a), ew.Node(s3b)
+na.tick(); nb.tick()
+sj = na.make_job("test:s3", "on S3", "s3b", "x", priority=0)
+nb.tick(); na.tick()
+check("[cluster] on S3: one ridge holder, and a job claimed once (conditional writes)",
+      na.leading != nb.leading and nb.st.get("active") in (sj or "") and na.st.get("active") not in (sj or "x"), (na.leading, nb.leading, nb.st))
 
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
 sys.exit(1 if FAILED else 0)

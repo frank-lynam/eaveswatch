@@ -2,7 +2,7 @@
 # EC2 user-data for an autoscaling group: runs as root at first boot. The image already has the PeopleSoft (or
 # other) services as user units of PSUSER. One instance was set up by hand first, with
 #   eaveswatch URL MODEL --system ps-hr-app
-# and its loop keeps the system's profile current in the bucket.
+# which shares the system's config; everything else the system knows is in the bucket.
 set -euo pipefail
 PSUSER=psadm2
 SYSTEM=ps-hr-app
@@ -14,4 +14,4 @@ loginctl enable-linger "$PSUSER"                     # user units run with nobod
 uid=$(id -u "$PSUSER")
 until [ -S "/run/user/$uid/bus" ]; do sleep 1; done  # the user's systemd is up
 sudo -u "$PSUSER" -i env XDG_RUNTIME_DIR="/run/user/$uid" EAVESWATCH_MODEL_KEY="$KEY" \
-  bash -lc "pipx install hobkin-eaveswatch && eaveswatch restore $STORE $SYSTEM"
+  bash -lc "pipx install hobkin-eaveswatch && eaveswatch join $STORE $SYSTEM"

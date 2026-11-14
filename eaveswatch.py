@@ -2,7 +2,9 @@
 """eaveswatch: logs, inventory and connections from every host, interpreted by a hobkin and reviewed by one.
 
     eaveswatch URL MODEL [KEY]        set this box up as a finial and start its reviewer, in one go (asks for a bucket)
-    eaveswatch restore STORE SYSTEM   a new instance (an ASG's) sets itself up from its system's saved profile
+    eaveswatch join STORE SYSTEM      a new instance (an ASG's) joins its system: no questions, secrets from env
+    eaveswatch watch                  for the reviewer's wake: the review this node claimed, or nothing
+    eaveswatch job done|release ID    the reviewer finished, or gives a review back; job list: the system's
     eaveswatch eave   [--once]        on a host: its interpreter's sources -> templates and counts; inventory, flows;
                                       all spooled, then sent to the store; answers the ridge's asks
     eaveswatch ridge  [sync] [--once] the hub's loop (no model): new files from the store -> the data folder
@@ -47,15 +49,16 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   the reviewer the hobkin chore (chore.json, CHORE.md), written out by `eaveswatch chore`
 #   check        `eaveswatch check`: each role's permissions, the interpreter, sources, versions, clock, a preview
 #   setup        `eaveswatch URL MODEL [KEY]`: a finial in one command, then hobkin's own setup with the chore
-#   profiles     a system's setup saved in the store (by the loop) and `eaveswatch restore`d on a new instance
+#   cluster      a system's nodes: shared state in the store, the ridge lease, review jobs, join, the node's watch
 #   command line
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 import argparse
 import configparser
 import datetime as dt
+import fcntl
 import fnmatch
 import glob
 import gzip
@@ -68,6 +71,7 @@ import pwd
 import re
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -96,6 +100,8 @@ DEFAULTS = {
     "notify": None,              # where alerts and the reviewer's notes go: {"email": ADDR, "sendmail": PATH} or
                                  # {"email": ADDR, "smtp": "host:port"}; "from", "per_hour" (20). None: kept, not sent
     "publish": None,             # {"dir": PATH}: a folder a web server already serves; the findings page is copied there
+    "cluster": None,             # timings for a system of several nodes: lease_seconds, claim_seconds, job_wait_seconds,
+                                 # node_gone_seconds, job_keep_days (see CLUSTER)
     "ridge": {"data": None, "envs": None, "silent_after": 7200,    # data default: STATE_DIR/ridge
               "late_hours": 24, "late_every": 600},   # every late_every s, look this far back for late arrivals
 }
@@ -226,30 +232,61 @@ def run(cmd: list[str], timeout: int = 30) -> str:
 
 
 # ---- stores
+class Conflict(Exception):
+    """A conditional write lost: the object was there already (if_none_match), or changed since it was read."""
+
+
 class FolderStore:
-    """A folder laid out like the bucket: for `local`, tests, or a shared mount."""
+    """A folder laid out like the bucket, with S3's conditional writes (under a lock): for one box, tests, or a
+    shared mount."""
 
     def __init__(self, root: str):
         self.root = os.path.expanduser(root[len("file://"):] if root.startswith("file://") else root)
 
-    def put(self, key: str, data: bytes) -> None:
+    def put(self, key: str, data: bytes, if_none_match: bool = False, if_match: str | None = None) -> str:
+        """Write it; with if_none_match only if it isn't there, with if_match only if its etag is still that.
+        Returns its etag. Raises Conflict when a condition fails."""
         path = os.path.join(self.root, key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".part"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
+        os.makedirs(self.root, exist_ok=True)
+        with open(os.path.join(self.root, ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if if_none_match and os.path.exists(path):
+                raise Conflict(key)
+            if if_match is not None:
+                try:
+                    with open(path, "rb") as f:
+                        now = hashlib.md5(f.read()).hexdigest()
+                except OSError:
+                    raise Conflict(key) from None
+                if now != if_match:
+                    raise Conflict(key)
+            tmp = f"{path}.part{os.getpid()}"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        return hashlib.md5(data).hexdigest()
 
     def get(self, key: str) -> bytes:
         with open(os.path.join(self.root, key), "rb") as f:
             return f.read()
+
+    def get_etag(self, key: str) -> tuple[bytes, str]:
+        data = self.get(key)
+        return data, hashlib.md5(data).hexdigest()
+
+    def delete(self, key: str) -> None:
+        try:
+            os.remove(os.path.join(self.root, key))
+        except FileNotFoundError:
+            pass
 
     def list(self, prefix: str) -> list[str]:
         base = os.path.join(self.root, prefix)
         out = []
         for d, _, files in os.walk(base):
             for n in files:
-                if not n.endswith(".part"):
+                if ".part" not in n and n != ".lock":
                     out.append(os.path.relpath(os.path.join(d, n), self.root).replace(os.sep, "/"))
         return sorted(out)
 
@@ -326,7 +363,8 @@ class S3Store:
     def _full(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
 
-    def _request(self, method: str, key: str = "", query: dict | None = None, body: bytes = b"") -> bytes:
+    def _request(self, method: str, key: str = "", query: dict | None = None, body: bytes = b"",
+                 extra: dict | None = None, want_headers: bool = False):
         query = query or {}
         if self.endpoint:
             u = urllib.parse.urlsplit(self.endpoint)
@@ -339,6 +377,7 @@ class S3Store:
         headers = {"host": host, "x-amz-date": amz_date, "x-amz-content-sha256": payload}
         if token:
             headers["x-amz-security-token"] = token
+        headers.update(extra or {})                  # conditional writes: If-None-Match, If-Match (signed too)
         headers["Authorization"] = sign_v4(method, host, path, query, headers, payload, self.region, "s3", key_id, secret, amz_date)
         qs = urllib.parse.urlencode(sorted(query.items()), quote_via=lambda v, *_: urllib.parse.quote(v, safe="-_.~"))
         req = urllib.request.Request(f"{scheme}://{host}{path}" + (f"?{qs}" if qs else ""), data=body if method == "PUT" else None,
@@ -346,20 +385,33 @@ class S3Store:
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 self.last_date = r.headers.get("Date")
-                return r.read()
+                data = r.read()
+                return (data, r.headers) if want_headers else data
         except urllib.error.HTTPError as e:
             self.last_date = e.headers.get("Date") if e.headers else None
+            if e.code in (409, 412) and extra:      # a conditional write lost (409: two at once)
+                raise Conflict(key) from None
             body = e.read().decode(errors="replace")
             code = re.search(r"<Code>([^<]+)</Code>", body)
             msg = re.search(r"<Message>([^<]+)</Message>", body)
             raise urllib.error.HTTPError(e.url, e.code, f"{e.code} {code.group(1) if code else e.reason}"
                                          + (f": {msg.group(1)}" if msg else ""), e.headers, None) from None
 
-    def put(self, key: str, data: bytes) -> None:
-        self._request("PUT", self._full(key), body=data)
+    def put(self, key: str, data: bytes, if_none_match: bool = False, if_match: str | None = None) -> str:
+        """Write it; conditionally like S3 does (If-None-Match: *, If-Match: ETAG). Returns its etag."""
+        extra = {"If-None-Match": "*"} if if_none_match else {"If-Match": f'"{if_match}"'} if if_match else None
+        _, h = self._request("PUT", self._full(key), body=data, extra=extra, want_headers=True)
+        return (h.get("ETag") or "").strip('"')
 
     def get(self, key: str) -> bytes:
         return self._request("GET", self._full(key))
+
+    def get_etag(self, key: str) -> tuple[bytes, str]:
+        data, h = self._request("GET", self._full(key), want_headers=True)
+        return data, (h.get("ETag") or "").strip('"')
+
+    def delete(self, key: str) -> None:
+        self._request("DELETE", self._full(key))
 
     def list(self, prefix: str) -> list[str]:
         out, token, strip = [], None, len(self.prefix) + 1 if self.prefix else 0
@@ -910,10 +962,13 @@ def rollback_spec(cfg: dict, to: int | None) -> str:
         to = next((h.get("from") for h in reversed(hist) if h.get("version") == cur), None)
     if not to or not os.path.exists(os.path.join(d, f"v{to}.json")):
         raise SpecError(f"no version to roll back to ({'none before this one' if to is None else f'no v{to}'})")
-    rec = {"version": int(to), "applied": iso(now_utc()), "note": f"rollback from v{cur}", "from": cur}
+    versions = sorted(int(m.group(1)) for n in os.listdir(d) for m in [re.fullmatch(r"v(\d+)\.json", n)] if m)
+    n = versions[-1] + 1
+    write_json(os.path.join(d, f"v{n}.json"), read_json(os.path.join(d, f"v{to}.json"), {}))   # a new version: it spreads
+    rec = {"version": n, "applied": iso(now_utc()), "note": f"rollback to v{to}'s spec (from v{cur})", "from": cur}
     write_json(os.path.join(d, "active.json"), rec)
     append_jsonl(os.path.join(d, "history.jsonl"), {"event": "rollback", **rec})
-    return f"active: v{to} (was v{cur})"
+    return f"active: v{n}, v{to}'s spec again (was v{cur})"
 
 
 def show_spec(cfg: dict) -> str:
@@ -1596,6 +1651,7 @@ class Eave:
         if raw:
             written.append(self.put("raw", raw, t))
         fired = self.check_alerts(t, agg)
+        self.last_fired = list(getattr(self, "last_fired", []) or []) + fired     # a node shares them with the system
         if fired:
             written.append(self.put("alerts", fired, t))
             if self.inbox:                               # a finial: straight to the person (a fleet's ridge does it on sync)
@@ -1827,7 +1883,7 @@ class Ridge:
         """Already fetched: it's in the inbox, or watch has archived it. The data folder is the record."""
         return os.path.exists(self.p("inbox", key)) or os.path.exists(self.p("archive", key))
 
-    def sync(self, deep: bool | None = None) -> int:
+    def sync(self, deep: bool | None = None, hosts: set | None = None) -> int:
         """New files from the store: the last two hours on every sync, and every late_every seconds the last
         late_hours too (an eave whose store was away sends its spool late, into the hours the files belong to)."""
         store = self.store or open_store(self.cfg)
@@ -1840,7 +1896,7 @@ class Ridge:
             for kind in RIDGE_READS:
                 for back in range(hours - 1, -1, -1):
                     for key in store.list(hour_prefix(env, kind, t - dt.timedelta(hours=back))):
-                        if self.have(key):
+                        if self.have(key) or (hosts is not None and key_host(key) not in hosts):
                             continue
                         dest = self.p("inbox", key)
                         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -1851,9 +1907,9 @@ class Ridge:
                         os.replace(tmp, dest)
                         got += 1
                         if kind == "alerts":             # a fleet's alerts reach the person as they arrive
-                            for a in unpack(data):
+                            for a in unpack(data):     # (a node that fired it may have sent it: the key says)
                                 queue_note(self.cfg, f"{a.get('rule')}: {str(a.get('detail'))[:120]}", alert_body(a),
-                                           a.get("severity", "warn"), "alert")
+                                           a.get("severity", "warn"), "alert", dedupe=alert_key(a))
         if deep:
             st["deep_at"] = iso(t)
         for name in sorted(os.listdir(self.p("outbox"))) if os.path.isdir(self.p("outbox")) else []:
@@ -1869,6 +1925,12 @@ class Ridge:
 
     # --- watch: the inbox -> the map, and a digest of what's worth a look (silence: nothing is)
     def watch(self) -> str:
+        notes, silent, n = self.merge()
+        return self.digest(notes, silent, n) if n else ""
+
+    def merge(self) -> tuple[dict, list, int]:
+        """The inbox into the map (hosts, edges, templates); what's notable, as notes. Returns (notes, hosts gone
+        quiet, files merged)."""
         inbox = self.p("inbox")
         # (a file still being fetched is a .part; it waits for the next watch)
         files = sorted(os.path.relpath(os.path.join(d, n), inbox) for d, _, ns in os.walk(inbox) for n in ns
@@ -1876,7 +1938,7 @@ class Ridge:
         chdir = self.p("discovery", "changes")
         changes = sorted(n for n in os.listdir(chdir) if n.endswith(".json")) if os.path.isdir(chdir) else []
         if not files and not changes:
-            return ""
+            return {}, [], 0
         hosts = read_json(self.p("map", "hosts.json"), {})
         edges = read_json(self.p("map", "edges.json"), {})
         tmpls = read_json(self.p("map", "templates.json"), {})
@@ -1923,7 +1985,7 @@ class Ridge:
         write_json(self.p("map", "hosts.json"), hosts)
         write_json(self.p("map", "edges.json"), edges)
         write_json(self.p("map", "templates.json"), tmpls)
-        return self.digest(notes, silent, len(files))
+        return notes, silent, len(files) + len(changes)
 
     def merge_inventory(self, hosts, r, rel, notes):
         h = r.get("host")
@@ -2045,7 +2107,7 @@ class Ridge:
 
     def ask(self, host: str, what: str, **params) -> str:
         req = {"what": what, "host": safe_name(host), "env": params.pop("env", None) or self.cfg["env"],
-               "asked": iso(now_utc()), "id": secrets.token_hex(4), **{k: v for k, v in params.items() if v is not None}}
+               "asked": iso(now_utc()), "id": secrets.token_hex(4), "asked_by": self.cfg["host"], **{k: v for k, v in params.items() if v is not None}}
         path = self.p("outbox", f"{stamp(now_utc())}_{req['id']}.json")
         write_json(path, req)
         return path
@@ -2066,11 +2128,16 @@ def findings(cfg: dict) -> dict:
         lines = open(ledger_path(cfg)).read().splitlines()
     except OSError:
         return out
+    events = []
     for line in lines:
         try:
-            e = json.loads(line)
+            events.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+    events.sort(key=lambda e: (e.get("at") or "", {"new": 0, "seen": 1, "status": 2}.get(e.get("event"), 3)))
+    for e in events:                        # in time order: every node folds the same events the same way
+        if e.get("event") == "new" and e.get("id") in out and out[e["id"]].get("sightings"):
+            e = {**e, "event": "seen"}           # two nodes found the same thing: one finding, seen twice
         f = out.setdefault(e["id"], {"id": e["id"], "sightings": 0, "history": []})
         if e["event"] == "new":
             f.update({k: v for k, v in e.items() if k not in ("event",)}, status="open", sightings=1)
@@ -2082,6 +2149,14 @@ def findings(cfg: dict) -> dict:
             f["status"] = e["status"]
         f["history"].append({k: e.get(k) for k in ("event", "at", "status", "why") if e.get(k) is not None})
     return out
+
+
+def ledger_event(cfg: dict, ev: dict) -> None:
+    """A findings event: into this node's ledger, and its outbox for the system's (a node syncs it)."""
+    ev = {**ev, "node": cfg["host"]}
+    append_jsonl(ledger_path(cfg), ev)
+    write_json(os.path.join(cfg["ridge"]["data"], "ledger", "outbox",
+                            f"{stamp(now_utc())}_{cfg['host']}_{secrets.token_hex(3)}.json"), ev)
 
 
 def finding_add(cfg: dict, f: dict) -> str:
@@ -2098,13 +2173,12 @@ def finding_add(cfg: dict, f: dict) -> str:
         charter_v = None
     old = findings(cfg).get(fid)
     if old and old.get("status") not in ("fixed", "dismissed"):
-        append_jsonl(ledger_path(cfg), {"event": "seen", "id": fid, "at": t, "evidence": f["evidence"],
-                                        "inputs": f.get("inputs")})
+        ledger_event(cfg, {"event": "seen", "id": fid, "at": t, "evidence": f["evidence"], "inputs": f.get("inputs")})
         return f"{fid} seen again (now {old['sightings'] + 1} times)"
     if old and old.get("status") == "dismissed":
         return f"{fid} was dismissed ({(old['history'][-1] or {}).get('why') or 'no reason given'}): not recorded again"
-    append_jsonl(ledger_path(cfg), {"event": "new", "id": fid, "at": t, "charter": charter_v,
-                                    **{k: v for k, v in f.items() if k not in ("id", "event", "at")}})
+    ledger_event(cfg, {"event": "new", "id": fid, "at": t, "charter": charter_v,
+                       **{k: v for k, v in f.items() if k not in ("id", "event", "at", "node")}})
     return f"{fid} recorded" + (" (it had been fixed: this is a regression)" if old else "")
 
 
@@ -2115,7 +2189,7 @@ def finding_status(cfg: dict, fid: str, status: str, why: str | None) -> str:
         raise ValueError(f"no finding {fid}")
     if status == "dismissed" and not why:
         raise ValueError("a dismissal needs --why: it's how the next review learns")
-    append_jsonl(ledger_path(cfg), {"event": "status", "id": fid, "at": iso(now_utc()), "status": status, "why": why})
+    ledger_event(cfg, {"event": "status", "id": fid, "at": iso(now_utc()), "status": status, "why": why})
     return f"{fid} {status}"
 
 
@@ -2126,12 +2200,14 @@ def notify_dir(cfg: dict, *parts) -> str:
     return os.path.join(cfg["ridge"]["data"], "notify", *parts)
 
 
-def queue_note(cfg: dict, subject: str, body: str, severity: str = "warn", source: str = "reviewer") -> str:
-    """Queue a note for a person. The reviewer can do this from its sandbox: it only writes the data folder."""
+def queue_note(cfg: dict, subject: str, body: str, severity: str = "warn", source: str = "reviewer",
+               dedupe: str | None = None) -> str:
+    """Queue a note for a person. The reviewer can do this from its sandbox: it only writes the data folder. With
+    dedupe, a system's nodes send it once between them."""
     t = now_utc()
     path = notify_dir(cfg, "queue", f"{stamp(t)}_{secrets.token_hex(3)}.json")
     write_json(path, {"at": iso(t), "subject": subject[:200], "body": body[:20000], "severity": severity,
-                      "source": source, "host": cfg["host"]})
+                      "source": source, "host": cfg["host"], **({"dedupe": dedupe} if dedupe else {})})
     return path
 
 
@@ -2167,7 +2243,7 @@ def send_mail(conf: dict, subject: str, body: str) -> None:
         raise OSError(f"{cmd} exited {r.returncode}: {r.stderr.decode(errors='replace')[:300]}")
 
 
-def deliver_notes(cfg: dict) -> tuple[int, int]:
+def deliver_notes(cfg: dict, once=None) -> tuple[int, int]:
     """Send what's queued, oldest first, at most notify.per_hour an hour (the rest wait, and the next note says how
     many are waiting). With no channel set, notes stay in notify/unsent/. Returns (sent, still waiting)."""
     q = notify_dir(cfg, "queue")
@@ -2190,6 +2266,10 @@ def deliver_notes(cfg: dict) -> tuple[int, int]:
         note = read_json(os.path.join(q, n), None)
         if not note:
             os.remove(os.path.join(q, n))
+            continue
+        if once and note.get("dedupe") and not once(note["dedupe"]):    # another node sent this one
+            os.makedirs(notify_dir(cfg, "deduped"), exist_ok=True)
+            os.replace(os.path.join(q, n), notify_dir(cfg, "deduped", n))
             continue
         waiting = len(names) - i - 1
         tag = "ALERT" if note.get("severity") == "page" else "eaveswatch"
@@ -2262,9 +2342,27 @@ def render_report(cfg: dict) -> str:
         f"<tr><td>{_h(a.get('at'))}</td><td class='{'page' if a.get('severity') == 'page' else 'warn'}'>{_h(a.get('rule'))}</td>"
         f"<td>{_h(a.get('host'))}</td><td>{_h(a.get('detail'))}</td></tr>" for a in reversed(alerts)) + "</table>"
         if alerts else "<p class='muted'>None yet.</p>"))
-    parts.append("<h2>Recent digests</h2>" + ("".join(
-        f"<details><summary>{_h(n)}</summary><pre>{_h(_read(os.path.join(dd, n))[:30000])}</pre></details>" for n in reversed(digests))
-        or "<p class='muted'>None yet.</p>"))
+    jobs = read_json(os.path.join(data, "state", "jobs.json"), [])
+    nodes = read_json(os.path.join(data, "state", "nodes.json"), {})
+    now = time.time()
+    if jobs:
+        def jstate(j):
+            if j.get("done"):
+                return f"done on {j['done'].get('host')}" + (f": {j['done'].get('note')}" if j["done"].get("note") else "")
+            c = j.get("claim")
+            return f"being reviewed on {c['host']}" if c and float(c.get("until", 0)) > now else "waiting for a reviewer"
+        parts.append("<h2>Reviews</h2><table><tr><th>when</th><th>what</th><th>evidence from</th><th>state</th></tr>" + "".join(
+            f"<tr><td>{_h(j.get('created'))}</td><td>{_h(j.get('title'))}</td><td>{_h(j.get('affinity') or 'any')}</td>"
+            f"<td>{_h(jstate(j))}</td></tr>" for j in jobs[:40]) + "</table>")
+    if nodes:
+        parts.append("<h2>Nodes</h2><table><tr><th>node</th><th>state</th><th>doing</th><th>last heard</th></tr>" + "".join(
+            f"<tr><td>{_h(h)}</td><td class='{'ok' if not n.get('left') and now - float(n.get('ts', 0)) < 300 else 'warn'}'>"
+            f"{'left' if n.get('left') else 'alive' if now - float(n.get('ts', 0)) < 300 else 'gone quiet'}"
+            f"{' · ridge' if n.get('leading') else ''}</td><td>{_h('reviewing ' + n['job'] if n.get('job') else '')}</td>"
+            f"<td>{_h(n.get('at'))}</td></tr>" for h, n in sorted(nodes.items())) + "</table>")
+    if digests:
+        parts.append("<h2>Recent digests</h2>" + "".join(
+            f"<details><summary>{_h(n)}</summary><pre>{_h(_read(os.path.join(dd, n))[:30000])}</pre></details>" for n in reversed(digests)))
     parts.append("<h2>Hosts</h2><table><tr><th>host</th><th>versions</th><th>last seen</th></tr>" + "".join(
         f"<tr><td>{_h(h)}</td><td>{_h(', '.join(f'{k} {str(x)[:12]}' for k, x in (r.get('services') or {}).items()))}</td>"
         f"<td>{_h(r.get('last_seen'))}</td></tr>" for h, r in sorted(hosts.items())) + "</table>"
@@ -2306,19 +2404,11 @@ def publish_report(cfg: dict) -> str | None:
 
 
 def iam_policy(cfg: dict) -> dict:
-    """The least this role needs from S3, as an IAM policy."""
+    """The least this role needs from S3, as an IAM policy. A node of a system also reads and writes the system's
+    shared state, and (a finial: any one may hold the ridge duty) reads its environment's data."""
     u = urllib.parse.urlsplit(cfg["store"])
     b, pre = u.netloc, (u.path.strip("/") + "/") if u.path.strip("/") else ""
-    arn = f"arn:aws:s3:::{b}"
-    stmts = [{"Sid": "WriteOwnHost", "Effect": "Allow", "Action": "s3:PutObject", "Resource": f"{arn}/{pre}*/host={cfg['host']}/*"}]
-    if cfg["role"] in ("finial", "eave"):           # its system's profile: saved by the loop, read by a new instance
-        stmts.append({"Sid": "SystemProfile", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
-                      "Resource": f"{arn}/{pre}profiles/system={cfg['system']}/*"})
-    if cfg["role"] == "eave":
-        stmts += [{"Sid": "ListAsks", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
-                   "Condition": {"StringLike": {"s3:prefix": f"{pre}env=*/kind=requests/*"}}},
-                  {"Sid": "ReadAsks", "Effect": "Allow", "Action": "s3:GetObject",
-                   "Resource": f"{arn}/{pre}env=*/kind=requests/*/host={cfg['host']}/*"}]
+    arn, env, system = f"arn:aws:s3:::{b}", cfg["env"], cfg["system"]
     if cfg["role"] == "ridge":
         kinds = [f"{pre}env=*/kind={k}/*" for k in RIDGE_READS]
         stmts = [{"Sid": "ListWhatItSyncs", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
@@ -2326,6 +2416,18 @@ def iam_policy(cfg: dict) -> dict:
                  {"Sid": "ReadWhatItSyncs", "Effect": "Allow", "Action": "s3:GetObject", "Resource": [f"{arn}/{k}" for k in kinds]},
                  {"Sid": "SendAsksAndProbes", "Effect": "Allow", "Action": "s3:PutObject",
                   "Resource": [f"{arn}/{pre}env=*/kind=requests/*", f"{arn}/{pre}env=*/kind=check/*"]}]
+        return {"Version": "2012-10-17", "Statement": stmts}
+    stmts = [{"Sid": "WriteOwnHost", "Effect": "Allow", "Action": "s3:PutObject",
+              "Resource": [f"{arn}/{pre}*/host={cfg['host']}/*", f"{arn}/{pre}env={env}/kind=requests/*"]},
+             {"Sid": "SystemState", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+              "Resource": f"{arn}/{pre}systems/system={system}/*"},
+             {"Sid": "List", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
+              "Condition": {"StringLike": {"s3:prefix": [f"{pre}systems/system={system}/*", f"{pre}env={env}/*"]}}},
+             {"Sid": "ReadAsksAndAnswers", "Effect": "Allow", "Action": "s3:GetObject",
+              "Resource": [f"{arn}/{pre}env={env}/kind=requests/*", f"{arn}/{pre}env={env}/kind=answers/*"]}]
+    if cfg["role"] == "finial":                       # the ridge duty can come to any finial: it reads the others' data
+        stmts.append({"Sid": "RidgeDutyReads", "Effect": "Allow", "Action": "s3:GetObject",
+                      "Resource": [f"{arn}/{pre}env={env}/kind={k}/*" for k in ("packets", "inventory", "flows", "alerts")]})
     return {"Version": "2012-10-17", "Statement": stmts}
 
 
@@ -2350,7 +2452,7 @@ CHORE_JSON = {
     "config": {
         "idle_prompt": None,
         "safe_mode": {"write": ["{{data}}"]},
-        "wake": {"command": "{{command}} --config {{config}} ridge watch", "every": "1m"},   # silent is free: wake fast
+        "wake": {"command": "{{command}} --config {{config}} watch", "every": "1m"},   # silent unless a review is ours
         "alert_command": "{{command}} --config {{config}} notify",     # notify, and hobkin's own alerts: the person's queue
     },
 }
@@ -2366,15 +2468,30 @@ wakes you with a **digest** when there's something to look at, and is silent
 
 You have two jobs: **keep the interpreter right**, and **review**.
 
-## Restored from a profile
+## One of several nodes
 
-If `{{data}}/restored.json` exists, this box was set up from its system's saved
-profile: the interpreter, alert rules and charter came from another instance of
-this system (an autoscaling group, say). Run `discover`, compare what this box runs
-and writes with what the interpreter expects, and fix what differs (paths,
-versions, units): that's narrowing and fixing, so it's yours. Tell your person
-in one note what you changed, or that it matched. Your changes save to the
-profile by themselves, for the next instance.
+This box may be one node of a system (an autoscaling group, say): every node
+runs an eave and a reviewer like you, and what the system knows (the
+interpreter, alert rules, your charter, findings, alerts, the map) is shared
+through the store, so any node can drop out at any moment. Whichever node holds
+the **ridge** duty (plain code, not you) merges everyone's data and turns what's
+new into **review jobs**, each naming the host its evidence came from. That
+host's reviewer gets it first; if it doesn't take it, any node does. So you
+review what's routed to you, not everything.
+
+- Your watch wakes you with **a review job** (and answers to your asks, and
+  notes from the system). Work it like a digest (below). When you've dealt with
+  it: `{{command}} --config {{config}} job done ID --note "what you found"`. Not
+  one you can do here? `job release ID`, and another node takes it.
+- A job whose evidence is from another host: ask that host
+  (`ask HOST lines FP`); the answer comes back to you.
+- Findings you record, the interpreter you apply and the charter you edit
+  reach every node within a minute. Another node may have just applied an
+  interpreter too: if yours lost the race, you'll be told; compare and redo it
+  if it's still needed.
+- If `{{data}}/joined.json` exists, this node joined an existing system: the
+  interpreter came from the others. Run `discover` and check it fits this box;
+  fix what differs, and say so.
 
 ## Setting up (no interpreter applied yet)
 
@@ -2444,7 +2561,8 @@ joined. Then:
 ## Alerts: the fast path, then you
 
 When a rule fires, the person gets a terse email at once (the eave sends it, not
-you), and your next digest starts with **Alerts fired**. That's your cue to
+you; once for the system, however many nodes saw it), and a review job for it
+goes to the node it fired on. That's your cue to
 follow up **now**, within minutes: read what fired and what's around it (the
 samples, the template's history, a deploy or config change before it, the
 code), then tell them what it means and what to do, in one note:
@@ -2457,7 +2575,7 @@ Use `--severity page` only when they must act now. One follow-up per alert (or
 per burst of the same one), not a running commentary. A rule that fires and
 means nothing is yours to fix: tighten it, or drop it, and say so.
 
-## Reviewing: when a digest wakes you
+## Reviewing: when a job (or a digest) wakes you
 
 1. **Read the digest, then the real things it points at** (the files under
    `inbox/`/`archive/`, `{{data}}/map/`, discovery, the code at the version named:
@@ -2584,12 +2702,14 @@ def check_store(c: Check, cfg: dict, store, role: str) -> None:
                  f"allow s3:PutObject on {cfg['store']}/*/host={cfg['host']}/*")
     if ok:
         c.ok("store: write", probe)
-    if role in ("finial", "eave"):               # its system's profile: saved by the loop, read by a new instance
-        pk = profile_prefix(cfg["system"]) + ".check"
-        ok, _ = step("profile", lambda: store.put(pk, b"{}"),
-                     f"allow s3:GetObject and s3:PutObject on {cfg['store']}/profiles/system={cfg['system']}/*")
+    if role in ("finial", "eave"):               # the system's shared state: every node reads and writes it
+        pk = sys_key(cfg, ".check")
+        fix = (f"allow s3:GetObject, s3:PutObject and s3:DeleteObject on {cfg['store']}/systems/system={cfg['system']}/*, "
+               "and s3:ListBucket on that prefix")
+        ok, _ = step("system state", lambda: (store.put(pk, b"{}"), store.get(pk), store.delete(pk),
+                                              store.list(sys_key(cfg, "nodes") + "/")), fix)
         if ok:
-            c.ok("store: profile", f"profiles/system={cfg['system']}/ (saved by the loop when the setup changes)")
+            c.ok("store: system state", f"systems/system={cfg['system']}/ (write, read, list, delete)")
     if role == "finial":
         pass                                      # a finial only writes: its asks and its ridge are right here
     elif role == "eave":
@@ -2948,6 +3068,10 @@ def setup(argv: list[str]) -> None:
     install_finial_unit(cfg_path, a.no_service, a.force)
     # what a new instance of this system needs to start the same reviewer: never the key, only where it'll be
     write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), {"url": a.url, "model": a.model, "key_env": a.key_env})
+    try:                                             # what the system's next node joins with
+        print(f"shared the system's config: {share_config(cfg, cfg_path)} (new nodes: eaveswatch join STORE {cfg['system']})")
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        print(f"note: couldn't share the system's config ({e}): new nodes can't join until it is (run this again)")
     start_reviewer(hob, cfg, cfg_path, a.url, a.model, a.key, a.no_service, not a.no_chat,
                    "starting the reviewer (hobkin): it looks at this box, then asks you what you care about")
 
@@ -2993,61 +3117,584 @@ def start_reviewer(hob: list[str], cfg: dict, cfg_path: str, url: str, model: st
     os.execvp(args[0], args)
 
 
-# ---- profiles: a system's setup in the store, so a new instance (an ASG's) sets itself up from it. What's
-# shared: the config (not the host), the interpreter (alert rules too), the charter, the reviewer's model API and
-# the NAME of the variable holding its key, and dismissed findings. Never secrets, never one machine's state.
-PROFILE_CONFIG_KEYS = ("role", "env", "store", "region", "endpoint", "every", "inventory_every", "discover_every",
-                       "spool_max_mb", "notify", "publish", "system")   # not folders: where a machine keeps its own state
+# ---- cluster: every instance of a system runs the same thing (a finial); what the system knows lives in the
+# store at PREFIX/systems/system=NAME/, so any node can drop out at any moment and lose nothing:
+#   config.json         the shared config and the reviewer's model API (its key's variable name, never the key)
+#   interpreter/vN.json every version (created only if absent: two nodes can't both make vN; the loser is told)
+#   charter.md          the reviewer's REVIEW.md (last writer wins; a clash is kept aside and told)
+#   ledger/EVENT.json   findings events, one object each (never overwritten); every node folds the same events
+#   alerts/KEY.json     fired alerts; sent/KEY.json: a note already sent (created only if absent: one email, not ten)
+#   nodes/HOST.json     heartbeats; lease/ridge.json: who does the ridge duty (renewed only if unchanged)
+#   jobs/ID.json        reviews, each naming the host its evidence came from; claimed only if unchanged
+#   state/*.json        the merged map, written by the ridge for every node's findings page
+# The ridge duty is plain code: merge everyone's data, spot what's new across the fleet and who's gone, make jobs.
+# The thinking goes where the evidence is: a job's own host claims it first, any node if that one doesn't.
+SYSTEM_CONFIG_KEYS = ("role", "env", "store", "region", "endpoint", "every", "inventory_every", "discover_every",
+                      "spool_max_mb", "notify", "publish", "system", "cluster")   # not host, not folders
+CLUSTER = {"lease_seconds": 180,      # the ridge lease: renewed every tick, taken over when it runs out
+           "claim_seconds": 600,      # a review claim: renewed every tick while the reviewer works on it
+           "job_wait_seconds": 120,   # how long a job waits for its own host before any node may take it
+           "node_gone_seconds": 300,  # a node silent this long (without saying it's leaving) is gone: a warning
+           "job_keep_days": 7}        # done jobs are tidied away after this
 
 
-def profile_prefix(system: str) -> str:
-    return f"profiles/system={safe_name(system)}/"
+def sys_key(cfg: dict, *parts: str) -> str:
+    return f"systems/system={cfg['system']}/" + "/".join(parts)
 
 
-def build_profile(cfg: dict, cfg_path: str) -> dict:
+def jget(store, key: str) -> tuple[dict | None, str | None]:
+    try:
+        data, etag = store.get_etag(key)
+        return json.loads(data), etag
+    except (OSError, urllib.error.URLError, ValueError, KeyError):
+        return None, None
+
+
+def jput(store, key: str, obj: dict, if_none_match: bool = False, if_match: str | None = None) -> str:
+    return store.put(key, json.dumps(obj, sort_keys=True, indent=1).encode(), if_none_match=if_none_match, if_match=if_match)
+
+
+def alert_key(a: dict) -> str:
+    """One alert across the system: the same rule and evidence in the same hour is one email and one job, however
+    many nodes see it (a unit or a silent source is per host, an error storm isn't)."""
+    try:
+        hour = int(parse_iso(a["at"]).timestamp() // 3600)
+    except (KeyError, ValueError):
+        hour = int(time.time() // 3600)
+    what = a.get("fp") or (f"{a.get('host')}:{a['unit']}" if a.get("unit") else f"{a.get('host')}:{a.get('source')}")
+    return hashlib.sha256(f"{a.get('rule')}|{what}|{hour}".encode()).hexdigest()[:16]
+
+
+def reviewer_item(cfg: dict, title: str, body: str) -> None:
+    """Something for this node's reviewer to read on its next wake (not a person: that's queue_note)."""
+    write_json(os.path.join(cfg["ridge"]["data"], "for-reviewer", f"{stamp(now_utc())}_{secrets.token_hex(2)}.json"),
+               {"title": title, "body": body})
+
+
+class Node:
+    """One instance of a system: its eave, its share of the system's state, the ridge duty when it holds the lease,
+    and the reviews it claims. A collector-only node (role eave) shares state but never leads or reviews."""
+
+    def __init__(self, cfg: dict, store=None):
+        self.cfg, self.cc = cfg, {**CLUSTER, **(cfg.get("cluster") or {})}
+        self.eave = Eave(cfg, store)
+        self.store = self.eave.store
+        self.ridge = Ridge(cfg, self.store)
+        self.data = cfg["ridge"]["data"]
+        self.host = cfg["host"]
+        self.reviews = cfg["role"] == "finial"
+        self.st_path = os.path.join(self.data, "node.json")
+        self.st = read_json(self.st_path, {})
+        self.leading = False
+        for d in ("ledger/outbox", "ledger/known", "jobs/active", "jobs/done", "jobs/release", "state", "map"):
+            os.makedirs(self.p(*d.split("/")), exist_ok=True)
+
+    def p(self, *parts) -> str:
+        return os.path.join(self.data, *parts)
+
+    def key(self, *parts) -> str:
+        return sys_key(self.cfg, *parts)
+
+    def save(self) -> None:
+        write_json(self.st_path, self.st)
+
+    # --- one tick: collect, share, lead (maybe), review (maybe), tell people, render the page
+    def tick(self) -> list[str]:
+        said = []
+        self.eave.tick()
+        steps = [self.heartbeat, self.sync_interpreter, self.sync_charter, self.sync_ledger, self.share_alerts,
+                 self.local_jobs, self.send_asks, self.fetch_answers, self.lead]
+        for step in steps:
+            try:
+                said += step() or []
+            except (OSError, urllib.error.URLError, ValueError, KeyError) as e:   # the store away: next tick
+                said.append(f"{step.__name__}: {e}")
+        if self.leading:
+            try:
+                said += self.ridge_duty()
+            except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
+                said.append(f"ridge duty: {e}")
+        if self.reviews:
+            try:
+                said += self.review_jobs()
+            except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
+                said.append(f"jobs: {e}")
+        try:
+            self.pull_state()
+        except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
+            said.append(f"state: {e}")
+        deliver_notes(self.cfg, once=self.send_once)
+        publish_report(self.cfg)
+        self.save()
+        return said
+
+    def heartbeat(self) -> list[str]:
+        jput(self.store, self.key("nodes", f"{self.host}.json"),
+             {"host": self.host, "at": iso(now_utc()), "ts": time.time(), "role": self.cfg["role"],
+              "eaveswatch": __version__, "interpreter": self.eave.interp.version, "leading": self.leading,
+              "job": self.st.get("active"), "spool": self.eave.spool_stats()["files"]})
+        return []
+
+    def members(self) -> dict:
+        out = {}
+        for k in self.store.list(self.key("nodes") + "/"):
+            hb, _ = jget(self.store, k)
+            if hb and hb.get("host"):
+                out[hb["host"]] = hb
+        return out
+
+    def alive(self, hb: dict) -> bool:
+        return not hb.get("left") and time.time() - float(hb.get("ts", 0)) < self.cc["node_gone_seconds"]
+
+    # --- the ridge lease: held by renewing it every tick, taken over when it runs out
+    def lead(self) -> list[str]:
+        if not self.reviews:
+            self.leading = False
+            return []
+        k, now = self.key("lease", "ridge.json"), time.time()
+        cur, etag = jget(self.store, k)
+        mine = {"host": self.host, "until": now + self.cc["lease_seconds"],
+                "since": cur["since"] if cur and cur.get("host") == self.host else now}
+        was = self.leading
+        try:
+            if cur is None:
+                jput(self.store, k, mine, if_none_match=True)
+            elif cur.get("host") == self.host or float(cur.get("until", 0)) < now:
+                jput(self.store, k, mine, if_match=etag)
+            else:
+                self.leading = False
+                return ["the ridge moved to " + cur["host"]] if was else []
+        except Conflict:
+            self.leading = False
+            return []
+        self.leading = True
+        return [] if was else [f"this node took the ridge duty (from {cur['host']})" if cur and cur.get("host") != self.host
+                               else "this node took the ridge duty"]
+
+    def leave(self) -> None:
+        """A clean stop (scale-in, shutdown): say so, give the lease and any review back."""
+        try:
+            hb_key = self.key("nodes", f"{self.host}.json")
+            hb, _ = jget(self.store, hb_key)
+            jput(self.store, hb_key, {**(hb or {"host": self.host}), "left": True, "at": iso(now_utc()), "ts": time.time()})
+            cur, etag = jget(self.store, self.key("lease", "ridge.json"))
+            if cur and cur.get("host") == self.host:
+                jput(self.store, self.key("lease", "ridge.json"), {**cur, "until": 0}, if_match=etag)
+            if self.st.get("active"):
+                self.give_back(self.st["active"])
+        except (OSError, urllib.error.URLError, ValueError, Conflict):
+            pass
+        self.save()
+
+    # --- shared state: the interpreter, the charter, the ledger, alerts, the map
+    def sync_interpreter(self) -> list[str]:
+        d, said = interp_dir(self.cfg), []
+        remote = {int(m.group(1)): k for k in self.store.list(self.key("interpreter") + "/")
+                  for m in [re.search(r"/v(\d+)\.json$", k)] if m}
+        rmax = max(remote, default=0)
+        _, lv = active_spec(self.cfg)
+        lv = lv or 0
+        if lv and lv > self.st.get("interp_synced", 0):               # applied here, not shared yet
+            spec = read_json(os.path.join(d, f"v{lv}.json"), None)
+            try:
+                if lv in remote:                   # someone shared a v{lv} already: the same, or a lost race
+                    theirs, _ = jget(self.store, remote[lv])
+                    if json.dumps(theirs, sort_keys=True) != json.dumps(spec, sort_keys=True):
+                        raise Conflict(remote[lv])
+                    self.st["interp_synced"] = lv
+                    return []
+                if lv < rmax:                      # the system moved on past this one
+                    raise Conflict(f"v{lv}")
+                jput(self.store, self.key("interpreter", f"v{lv}.json"), spec, if_none_match=True)
+                self.st["interp_synced"] = lv
+                return [f"shared interpreter v{lv}"]
+            except Conflict:                       # another node made v{lv} first: theirs stands
+                remote[lv] = self.key("interpreter", f"v{lv}.json")
+                rmax = max(rmax, lv)
+                os.replace(os.path.join(d, f"v{lv}.json"), os.path.join(d, f"v{lv}.lost.json"))
+                reviewer_item(self.cfg, "your interpreter change lost a race", f"Another node shared its own v{lv} at "
+                              f"the same time, and the system kept theirs. Yours is in {d}/v{lv}.lost.json: compare, and "
+                              "test and apply it again if it's still needed.")
+                said.append(f"interpreter v{lv} lost to another node's")
+                lv = 0
+        if rmax > lv or (rmax and not os.path.exists(os.path.join(d, f"v{rmax}.json"))):
+            spec, _ = jget(self.store, remote[rmax])
+            if spec is not None:
+                os.makedirs(d, exist_ok=True)
+                write_json(os.path.join(d, f"v{rmax}.json"), spec)
+                rec = {"version": rmax, "applied": iso(now_utc()), "note": "from the system", "from": lv or None}
+                write_json(os.path.join(d, "active.json"), rec)
+                append_jsonl(os.path.join(d, "history.jsonl"), {"event": "synced", **rec})
+                self.st["interp_synced"] = rmax
+                said.append(f"interpreter v{rmax} from the system")
+        return said
+
+    def sync_charter(self) -> list[str]:
+        path, k = self.p("REVIEW.md"), self.key("charter.md")
+        local = _read(path)
+        rec = self.st.get("charter") or {}
+        try:
+            remote, etag = self.store.get_etag(k)
+            remote = remote.decode(errors="replace")
+        except (OSError, urllib.error.URLError):
+            remote, etag = None, None
+        lh = hashlib.sha256(local.encode()).hexdigest() if local else None
+        if local and lh != rec.get("hash"):                        # changed here since the last sync
+            try:
+                etag = self.store.put(k, local.encode(), if_none_match=remote is None,
+                                      if_match=None if remote is None else (rec.get("etag") or etag))
+                self.st["charter"] = {"hash": lh, "etag": etag}
+                return ["shared the charter"]
+            except Conflict:                        # changed elsewhere too: theirs stands, ours is kept aside
+                with open(self.p("REVIEW.conflict.md"), "w") as f:
+                    f.write(local)
+                reviewer_item(self.cfg, "the charter changed on two nodes at once", "The system kept the other "
+                              f"node's REVIEW.md; yours is in {self.p('REVIEW.conflict.md')}. Merge what's still true.")
+                local = None
+        if remote is not None and etag != rec.get("etag"):         # changed elsewhere: take it
+            with open(path, "w") as f:
+                f.write(remote)
+            self.st["charter"] = {"hash": hashlib.sha256(remote.encode()).hexdigest(), "etag": etag}
+            return ["the charter from the system"]
+        return []
+
+    def sync_ledger(self) -> list[str]:
+        """Findings events: this node's go up (one object each), everyone's come down into the local ledger."""
+        out_dir, known = self.p("ledger", "outbox"), self.p("ledger", "known")
+        n_up = n_down = 0
+        for n in sorted(os.listdir(out_dir)):
+            ev = read_json(os.path.join(out_dir, n), None)
+            if ev is not None:
+                try:
+                    jput(self.store, self.key("ledger", n), ev, if_none_match=True)
+                except Conflict:
+                    pass
+            open(os.path.join(known, n), "w").close()
+            os.remove(os.path.join(out_dir, n))
+            n_up += 1
+        for k in self.store.list(self.key("ledger") + "/"):
+            n = k.rsplit("/", 1)[-1]
+            if os.path.exists(os.path.join(known, n)):
+                continue
+            ev, _ = jget(self.store, k)
+            if ev is not None:
+                with open(ledger_path(self.cfg), "a") as f:
+                    f.write(json.dumps(ev, sort_keys=True) + "\n")
+                n_down += 1
+            open(os.path.join(known, n), "w").close()
+        return [f"findings: {n_down} events from other nodes"] if n_down else []
+
+    def share_alerts(self) -> list[str]:
+        """What this node's rules just fired: one record per alert key for the system, a job where the evidence
+        is (here), and a note for the person, sent once however many nodes saw the same thing."""
+        said = []
+        for a in getattr(self.eave, "last_fired", []) or []:
+            k = alert_key(a)
+            try:
+                jput(self.store, self.key("alerts", f"{k}.json"), {**a, "key": k}, if_none_match=True)
+            except Conflict:
+                pass
+            self.make_job(f"alert:{k}", f"alert {a['rule']} on {a['host']}: {a['detail'][:120]}", a["host"],
+                          "## Alert fired (already sent to your person: follow up with what it means)\n\n" + alert_body(a),
+                          priority=0)
+            queue_note(self.cfg, f"{a['rule']}: {a['detail'][:120]}", alert_body(a), a["severity"], "alert", dedupe=k)
+            said.append(f"alert {a['rule']}")
+        self.eave.last_fired = []
+        return said
+
+    def local_jobs(self) -> list[str]:
+        """This box's own discoveries become jobs for this box: what changed in what runs and what it writes."""
+        chdir, said = self.p("discovery", "changes"), []
+        for n in sorted(os.listdir(chdir)) if os.path.isdir(chdir) else []:
+            if not n.endswith(".json"):
+                continue
+            ch = read_json(os.path.join(chdir, n), None)
+            if ch:
+                body = "## What changed on this box (discovery)\n" + "\n".join(
+                    f"- {k.replace('_', ' ')}: {', '.join(v[:20])}" for k, v in ch.items() if isinstance(v, list)) + \
+                    "\n\n(the whole picture: discovery/latest.md on this node)"
+                self.make_job(f"discovery:{self.host}:{n}", f"what runs on {self.host} changed", self.host, body)
+                said.append("discovery changes: a job")
+            os.makedirs(os.path.join(chdir, "seen"), exist_ok=True)
+            os.replace(os.path.join(chdir, n), os.path.join(chdir, "seen", n))
+        return said
+
+    def send_asks(self) -> list[str]:
+        outbox, t = self.p("outbox"), now_utc()
+        for n in sorted(os.listdir(outbox)) if os.path.isdir(outbox) else []:
+            if n.endswith(".json"):
+                req = read_json(os.path.join(outbox, n), None)
+                if req and req.get("host"):
+                    self.store.put(object_key(req.get("env") or self.cfg["env"], "requests", safe_name(req["host"]), t), pack([req]))
+                os.makedirs(os.path.join(outbox, "sent"), exist_ok=True)
+                os.replace(os.path.join(outbox, n), os.path.join(outbox, "sent", n))
+        return []
+
+    def fetch_answers(self) -> list[str]:
+        """Answers to this node's asks (any host may answer: they come through the store)."""
+        if not os.path.isdir(self.p("outbox", "sent")):
+            return []
+        mine, said, t = set(os.listdir(self.p("outbox", "sent"))), [], now_utc()
+        if not mine:
+            return []
+        for back in (1, 0):
+            for k in self.store.list(hour_prefix(self.cfg["env"], "answers", t - dt.timedelta(hours=back))):
+                dest = self.p("answers", k)
+                if os.path.exists(dest):
+                    continue
+                recs = unpack(self.store.get(k))
+                if any((r.get("request") or {}).get("asked_by") == self.host for r in recs):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "w") as f:
+                        f.write("".join(json.dumps(r, indent=1) + "\n" for r in recs))
+                    for r in recs:
+                        reviewer_item(self.cfg, f"an answer from {r.get('host')}",
+                                      f"You asked {json.dumps(r.get('request'))}. The answer is in {dest}:\n\n"
+                                      + json.dumps({x: r.get(x) for x in ("lines", "total", "inventory", "flows", "error")
+                                                    if r.get(x) is not None}, indent=1)[:6000])
+                    said.append(f"an answer from {recs[0].get('host')}")
+                else:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    open(dest, "w").close()                  # not ours: remembered as seen
+        return said
+
+    def send_once(self, key: str) -> bool:
+        """True if this node is the one to send the note with this key (nobody else has)."""
+        try:
+            jput(self.store, self.key("sent", f"{key}.json"), {"host": self.host, "at": iso(now_utc())}, if_none_match=True)
+            return True
+        except Conflict:
+            return False
+
+    # --- the ridge duty: plain code, on whichever node holds the lease
+    def ridge_duty(self) -> list[str]:
+        members = self.members()
+        said = []
+        got = self.ridge.sync(hosts=set(members) | {self.host})
+        notes, silent, n = self.ridge.merge()
+        said += self.jobs_from(notes) if n else []
+        now = time.time()
+        gone = self.st.setdefault("gone", {})
+        for h, hb in members.items():
+            if h == self.host:
+                continue
+            if not self.alive(hb) and not hb.get("left") and h not in gone:
+                gone[h] = now
+                quiet = int((now - float(hb.get("ts", 0))) // 60)
+                body = (f"{h} last checked in {quiet} min ago ({hb.get('at')}) without saying it was leaving: it may "
+                        f"have died, been terminated, or lost the store. It was "
+                        + ("reviewing a job (given back to the others)" if hb.get("job") else "idle") + ".")
+                queue_note(self.cfg, f"node {h} is gone", body, "warn", "ridge", dedupe=f"gone-{h}-{int(hb.get('ts', 0))}")
+                self.make_job(f"node-gone:{h}:{int(hb.get('ts', 0))}", f"node {h} went silent", None, "## A node went silent\n\n" + body)
+                said.append(f"node {h} is gone")
+            elif self.alive(hb):
+                gone.pop(h, None)
+            if hb.get("left") and now - float(hb.get("ts", 0)) > 7 * 86400:
+                self.store.delete(self.key("nodes", f"{h}.json"))
+        hosts = read_json(self.ridge.p("map", "hosts.json"), {})
+        edges = read_json(self.ridge.p("map", "edges.json"), {})
+        jput(self.store, self.key("state", "map.json"), {"hosts": hosts, "edges": edges, "at": iso(now_utc()),
+                                                          "by": self.host})
+        return said + ([f"ridge: {got} new files from the system"] if got else [])
+
+    def jobs_from(self, notes: dict) -> list[str]:
+        """The merge's notes as review jobs, grouped so one problem across ten hosts is one job, placed where the
+        most evidence is."""
+        day, made = time.strftime("%Y%m%d", time.gmtime()), []
+        by_fp = {}
+        for r in notes.get("spikes", []) + notes.get("new_templates", []):
+            by_fp.setdefault(r["fp"], []).append(r)
+        for fp, rs in by_fp.items():
+            top = max(rs, key=lambda r: r.get("count") or 0)
+            kind = "spiking" if any(r.get("spike") for r in rs) else "new"
+            body = (f"## A {kind} log template\n\n`{fp}` from {top.get('source')}: {top.get('template')}\n\n"
+                    + "\n".join(f"- {r.get('host')}: {r.get('count')}x (usual {r.get('usual', 0)})"
+                                + (f" @ {r['service']} {str(r.get('version'))[:12]}" if r.get("version") else "")
+                                + f"\n  e.g.: {(r.get('samples') or [''])[0][:300]}" for r in rs)
+                    + f"\n\nMore of these from a host: `ask HOST lines {fp}`.")
+            made.append(self.make_job(f"tmpl:{fp}:{day}", f"{kind} template on {len(rs)} host(s): {top.get('template', '')[:80]}",
+                                      top.get("host"), body))
+        per_host = {}
+        for v in notes.get("versions", []):
+            per_host.setdefault(v["host"], []).append(f"- deploy: {v['service']} {v['from'] or '?'} -> {v['to'] or '?'}")
+        for c in notes.get("config", []):
+            per_host.setdefault(c["host"], []).append(f"- config: {c['path']} {c['from'] or 'new'} -> {c['to'] or 'gone'}")
+        for c in notes.get("interpreter", []):
+            per_host.setdefault(c["host"], []).append(f"- interpreter v{c['from'] or '-'} -> v{c['to'] or '-'}")
+        for h in notes.get("new_hosts", []):
+            per_host.setdefault(h, []).append("- a new host in the system: check its setup matches the others")
+        for e in notes.get("new_edges", []):
+            per_host.setdefault(e.split(" ", 1)[0], []).append(f"- new connection or listener: {e}")
+        for h, lines in per_host.items():
+            text = "\n".join(lines[:60])
+            made.append(self.make_job(f"change:{h}:{hashlib.sha256(text.encode()).hexdigest()[:12]}", f"changes on {h}", h,
+                                      "## What changed\n\n" + text + (f"\n- ...and {len(lines) - 60} more" if len(lines) > 60 else "")))
+        for a in notes.get("alerts", []):      # usually made already, by the node that fired it (same key: same job)
+            self.make_job(f"alert:{alert_key(a)}", f"alert {a.get('rule')} on {a.get('host')}", a.get("host"),
+                          "## Alert fired (already sent to your person)\n\n" + alert_body(a), priority=0)
+        return [m for m in made if m]
+
+    def make_job(self, topic: str, title: str, affinity: str | None, body: str, priority: int = 1) -> str | None:
+        jid = hashlib.sha256(topic.encode()).hexdigest()[:12]
+        job = {"id": jid, "topic": topic, "title": title, "affinity": affinity, "body": body[:30000], "priority": priority,
+               "created": iso(now_utc()), "ts": time.time(), "by": self.host, "claim": None, "done": None}
+        try:
+            jput(self.store, self.key("jobs", f"{jid}.json"), job, if_none_match=True)
+            return f"job {jid}: {title}"
+        except Conflict:
+            return None
+
+    # --- reviews: claim the system's jobs, nearest evidence first; renew while working; done or given back
+    def review_jobs(self) -> list[str]:
+        said, now = [], time.time()
+        jobs = {}
+        for k in self.store.list(self.key("jobs") + "/"):
+            j, etag = jget(self.store, k)
+            if j:
+                jobs[j["id"]] = (j, etag, k)
+        members = self.members()
+        alive = {h for h, hb in members.items() if self.alive(hb)}
+        active = self.st.get("active")
+
+        def takeable(j):
+            c = j.get("claim")
+            if j.get("done") or (c and float(c.get("until", 0)) > now):
+                return False
+            if os.path.exists(self.p("jobs", "gave-back", j["id"])):
+                return False                         # this node gave it back: someone else's turn
+            return j.get("affinity") == self.host or j.get("affinity") not in alive or \
+                now - float(j.get("ts", now)) > self.cc["job_wait_seconds"]
+        if active and jobs.get(active, ({},))[0].get("priority", 1) > 0 and any(
+                j.get("priority", 1) == 0 and takeable(j) for j, _, _ in jobs.values()):
+            self.give_back(active)                   # an alert comes before a routine review
+            os.remove(self.p("jobs", "gave-back", active))     # (it may come back here later)
+            said.append(f"job {active} given back for an alert here")
+            active = None
+        if active:
+            j, etag, k = jobs.get(active, (None, None, None))
+            done_mark = self.p("jobs", "done", f"{active}.json")
+            if j is None or j.get("done") or (j.get("claim") or {}).get("host") != self.host:
+                self.drop_active(active)
+                said.append(f"job {active} is no longer ours")
+            elif os.path.exists(done_mark):
+                note = (read_json(done_mark, {}) or {}).get("note")
+                try:
+                    jput(self.store, k, {**j, "done": {"host": self.host, "at": iso(now_utc()), "note": note}}, if_match=etag)
+                    said.append(f"job {active} done")
+                except Conflict:
+                    pass
+                self.drop_active(active)
+            elif os.path.exists(self.p("jobs", "release", active)):
+                self.give_back(active)
+                os.remove(self.p("jobs", "release", active))
+                said.append(f"job {active} given back")
+            else:
+                try:
+                    jput(self.store, k, {**j, "claim": {"host": self.host, "until": now + self.cc["claim_seconds"]}}, if_match=etag)
+                except Conflict:
+                    self.drop_active(active)
+        if not self.st.get("active"):
+            for j, etag, k in sorted((v for v in jobs.values() if takeable(v[0])),
+                                     key=lambda v: (v[0].get("affinity") != self.host, v[0].get("priority", 1), v[0].get("ts", 0))):
+                try:
+                    jput(self.store, k, {**j, "claim": {"host": self.host, "until": now + self.cc["claim_seconds"]}}, if_match=etag)
+                except Conflict:
+                    continue
+                self.st["active"] = j["id"]
+                write_json(self.p("jobs", "active", f"{j['id']}.json"), j)
+                said.append(f"claimed job {j['id']}: {j['title']}")
+                break
+        keep = self.cc["job_keep_days"] * 86400
+        for j, etag, k in jobs.values():           # the ridge tidies done jobs away after a while
+            if self.leading and j.get("done") and now - float(j.get("ts", now)) > keep:
+                self.store.delete(k)
+        write_json(self.p("state", "jobs.json"), sorted((j for j, _, _ in jobs.values()), key=lambda j: -float(j.get("ts", 0)))[:200])
+        write_json(self.p("state", "nodes.json"), members)
+        return said
+
+    def drop_active(self, jid: str) -> None:
+        self.st.pop("active", None)
+        for d in ("active", "done"):
+            for n in (f"{jid}.json", f"{jid}.json.shown"):
+                try:
+                    os.remove(self.p("jobs", d, n))
+                except FileNotFoundError:
+                    pass
+
+    def give_back(self, jid: str) -> None:
+        k = self.key("jobs", f"{jid}.json")
+        j, etag = jget(self.store, k)
+        if j and (j.get("claim") or {}).get("host") == self.host and not j.get("done"):
+            try:
+                jput(self.store, k, {**j, "claim": None, "ts": time.time() - self.cc["job_wait_seconds"]}, if_match=etag)
+            except Conflict:
+                pass
+        os.makedirs(self.p("jobs", "gave-back"), exist_ok=True)
+        open(self.p("jobs", "gave-back", jid), "w").close()       # someone else's turn
+        self.drop_active(jid)
+
+    def pull_state(self) -> list[str]:
+        """The ridge's merged map, and the system's alerts, for this node's findings page."""
+        m, _ = jget(self.store, self.key("state", "map.json"))
+        if m and not self.leading:
+            write_json(self.p("map", "hosts.json"), m.get("hosts") or {})
+            write_json(self.p("map", "edges.json"), m.get("edges") or {})
+        seen = self.p("state", "alerts-known")
+        os.makedirs(seen, exist_ok=True)
+        for k in self.store.list(self.key("alerts") + "/"):
+            n = k.rsplit("/", 1)[-1]
+            if not os.path.exists(os.path.join(seen, n)):
+                a, _ = jget(self.store, k)
+                if a:
+                    append_jsonl(self.p("alerts.jsonl"), a)
+                open(os.path.join(seen, n), "w").close()
+        return []
+
+
+def node_watch(cfg: dict) -> str:
+    """What this node's reviewer should read now (its claimed job, answers, notes from the system), or nothing:
+    a node with nothing claimed is silent, so it costs nothing."""
+    data, parts = cfg["ridge"]["data"], []
+    for n in sorted(os.listdir(os.path.join(data, "jobs", "active"))) if os.path.isdir(os.path.join(data, "jobs", "active")) else []:
+        if n.endswith(".json") and not os.path.exists(os.path.join(data, "jobs", "active", n + ".shown")):
+            j = read_json(os.path.join(data, "jobs", "active", n), {})
+            here = "" if j.get("affinity") in (None, cfg["host"]) else \
+                f"\n(The evidence is from {j['affinity']}; that node didn't take it. Ask it: `ask {j['affinity']} lines FP`.)"
+            parts.append(f"# Review job {j.get('id')}: {j.get('title')}\n\n{j.get('body')}{here}\n\nWhen you've dealt with it: "
+                         f"`eaveswatch --config CONFIG job done {j.get('id')} --note \"what you found\"`; if it isn't one for you, "
+                         f"`job release {j.get('id')}`.")
+            open(os.path.join(data, "jobs", "active", n + ".shown"), "w").close()
+    fr = os.path.join(data, "for-reviewer")
+    for n in sorted(os.listdir(fr)) if os.path.isdir(fr) else []:
+        if n.endswith(".json"):
+            it = read_json(os.path.join(fr, n), {})
+            parts.append(f"## {it.get('title')}\n\n{it.get('body')}")
+            os.makedirs(os.path.join(fr, "seen"), exist_ok=True)
+            os.replace(os.path.join(fr, n), os.path.join(fr, "seen", n))
+    return "\n\n".join(parts) + ("\n" if parts else "")
+
+
+def share_config(cfg: dict, cfg_path: str, store=None) -> str:
+    """The system's shared config (what a new node needs to join), from this node's config and reviewer."""
     user = read_json(cfg_path, {}) or {}
-    spec, v = active_spec(cfg)
-    data = cfg["ridge"]["data"]
-    charter = _read(os.path.join(data, "REVIEW.md")) or None
-    dismissed = [{k: f.get(k) for k in ("id", "category", "location", "claim")} | {"why": next(
-        (h.get("why") for h in reversed(f.get("history") or []) if h.get("why")), None)}
-        for f in findings(cfg).values() if f.get("status") == "dismissed"]
-    return {"eaveswatch": __version__, "system": cfg["system"],
-            "config": {k: user[k] for k in PROFILE_CONFIG_KEYS if k in user},
-            "interpreter": {"version": v, "spec": spec} if v else None, "charter": charter,
-            "reviewer": read_json(os.path.join(data, "reviewer.json"), None), "dismissed": dismissed}
+    body = {"config": {k: user[k] for k in SYSTEM_CONFIG_KEYS if k in user},
+            "reviewer": read_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), None),
+            "saved": iso(now_utc()), "from_host": cfg["host"]}
+    k = sys_key(cfg, "config.json")
+    jput(store or open_store(cfg), k, body)
+    return k
 
 
-def save_profile(cfg: dict, cfg_path: str, store=None) -> str | None:
-    """Save the system's profile to the store if it changed since the last save (latest, and a copy in history).
-    Returns its key, or None if nothing changed."""
-    prof = build_profile(cfg, cfg_path)
-    h = hashlib.sha256(json.dumps(prof, sort_keys=True).encode()).hexdigest()
-    mark = os.path.join(cfg["ridge"]["data"], "profile.hash")
-    if _read(mark).strip() == h:
-        return None
-    store = store or open_store(cfg)
-    prof = {**prof, "saved": iso(now_utc()), "from_host": cfg["host"]}
-    body = json.dumps(prof, indent=1, sort_keys=True).encode()
-    pre = profile_prefix(cfg["system"])
-    store.put(f"{pre}history/profile_{stamp(now_utc())}_{secrets.token_hex(2)}.json", body)
-    store.put(f"{pre}profile.json", body)
-    os.makedirs(os.path.dirname(mark), exist_ok=True)
-    with open(mark, "w") as f:
-        f.write(h)
-    return f"{pre}profile.json"
-
-
-def restore(argv: list[str]) -> None:
-    """eaveswatch restore STORE SYSTEM: a new instance sets itself up from its system's saved profile, with no
-    questions (for an ASG's user-data). Secrets come from the environment: the model key from the variable the
-    profile names, AWS credentials from the instance profile."""
-    ap = argparse.ArgumentParser(prog="eaveswatch restore", description=restore.__doc__.split("\n")[0])
-    ap.add_argument("store", help="s3://bucket/prefix (or a folder) where the system's profile was saved")
+def join(argv: list[str]) -> None:
+    """eaveswatch join STORE SYSTEM: a new instance (an ASG's user-data) joins its system, with no questions. The
+    shared config comes from the store, the rest (interpreter, charter, findings) on the first tick; secrets from
+    the environment: the model key from the variable the system names, AWS credentials from the instance profile."""
+    ap = argparse.ArgumentParser(prog="eaveswatch join", description=join.__doc__.split("\n")[0])
+    ap.add_argument("store", help="s3://bucket/prefix (or a folder) the system shares")
     ap.add_argument("system")
-    ap.add_argument("--host", help="this instance's name in the store (default: its hostname)")
+    ap.add_argument("--host", help="this instance's name (default: its hostname)")
     ap.add_argument("--no-service", action="store_true")
-    ap.add_argument("--no-reviewer", action="store_true", help="set up the finial only, without starting the reviewer")
+    ap.add_argument("--no-reviewer", action="store_true", help="collect and share, without a reviewer on this node")
     ap.add_argument("--force", action="store_true", help="replace an existing setup here")
     a = ap.parse_args(argv)
     cfg_path = os.path.expanduser(SETUP_CONFIG)
@@ -3056,61 +3703,39 @@ def restore(argv: list[str]) -> None:
     region = (bucket_region(urllib.parse.urlsplit(a.store).netloc) or imds_region() or os.environ.get("AWS_REGION")
               or "us-east-1") if a.store.startswith("s3://") else None
     store = S3Store(a.store, region) if a.store.startswith("s3://") else FolderStore(a.store)
-    key = profile_prefix(a.system) + "profile.json"
-    try:
-        prof = json.loads(store.get(key))
-    except (OSError, urllib.error.URLError, ValueError) as e:
-        sys.exit(f"eaveswatch: no profile for {a.system!r} at {a.store}/{key} ({getattr(e, 'reason', e)}): "
-                 "set one instance up with `eaveswatch URL MODEL --system NAME` first; its loop saves the profile")
-    user = {**prof.get("config", {}), "system": a.system, **({"host": a.host} if a.host else {})}
+    shared, _ = jget(store, f"systems/system={safe_name(a.system)}/config.json")
+    if not shared:
+        sys.exit(f"eaveswatch: no system {a.system!r} at {a.store}: set its first node up with "
+                 f"`eaveswatch URL MODEL --system {a.system}`, which shares the config")
+    user = {**shared.get("config", {}), "system": a.system, **({"host": a.host} if a.host else {})}
     user.setdefault("state_dir", SETUP_STATE)
-    if region and a.store.startswith("s3://"):
+    if a.no_reviewer:
+        user["role"] = "eave"
+    if region:
         user["region"] = region
     write_json(cfg_path, user)
     cfg = load_config(cfg_path)
-    data = cfg["ridge"]["data"]
-    os.makedirs(data, exist_ok=True)
-    print(f"restored {a.system}'s profile (saved {prof.get('saved')} from {prof.get('from_host')}) into {cfg_path}")
-    if prof.get("interpreter"):
-        # validated, not replayed: the logs may not exist yet at boot; the reviewer checks it against this box
-        errs = validate_spec(prof["interpreter"]["spec"])
-        if errs:
-            sys.exit(f"eaveswatch: the saved interpreter doesn't validate here: {'; '.join(errs[:3])}")
-        d = interp_dir(cfg)
-        os.makedirs(d, exist_ok=True)
-        write_json(os.path.join(d, "v1.json"), prof["interpreter"]["spec"])
-        rec = {"version": 1, "applied": iso(now_utc()), "note": f"restored from {a.system}'s profile "
-               f"(v{prof['interpreter']['version']} on {prof.get('from_host')})", "from": None}
-        write_json(os.path.join(d, "active.json"), rec)
-        append_jsonl(os.path.join(d, "history.jsonl"), {"event": "restore", **rec})
-        print(f"  the interpreter: {len(prof['interpreter']['spec'].get('sources') or [])} sources, "
-              f"{len(prof['interpreter']['spec'].get('alerts') or [])} alert rules")
-    if prof.get("charter"):
-        with open(os.path.join(data, "REVIEW.md"), "w") as f:
-            f.write(prof["charter"])
-    for f in prof.get("dismissed") or []:              # dismissed stays dismissed on every instance
-        if f.get("id") and f["id"] not in findings(cfg):
-            t = iso(now_utc())
-            append_jsonl(ledger_path(cfg), {"event": "new", "id": f["id"], "at": t, "category": f.get("category"),
-                                            "location": f.get("location"), "claim": f.get("claim"), "restored": True})
-            append_jsonl(ledger_path(cfg), {"event": "status", "id": f["id"], "at": t, "status": "dismissed", "why": f.get("why")})
-    write_json(os.path.join(data, "restored.json"), {"system": a.system, "from_host": prof.get("from_host"),
-                                                     "saved": prof.get("saved"), "at": iso(now_utc())})
-    if prof.get("reviewer"):
-        write_json(os.path.join(data, "reviewer.json"), prof["reviewer"])
+    os.makedirs(cfg["ridge"]["data"], exist_ok=True)
+    rv = shared.get("reviewer")
+    if rv:
+        write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), rv)
+    write_json(os.path.join(cfg["ridge"]["data"], "joined.json"), {"system": a.system, "from_host": shared.get("from_host"),
+                                                                  "at": iso(now_utc())})
+    print(f"joined {a.system} (config shared by {shared.get('from_host')}) as {cfg['host']}: {cfg_path}")
+    node = Node(cfg, store)
+    for line in node.tick():                         # the interpreter, charter and findings, now
+        print(f"  {line}")
     text, _ = run_check(cfg, cfg_path)
-    fatal = [l for l in text.splitlines() if l.startswith("  FAIL") and not l.startswith("  FAIL  source")
-             and not l.startswith("  FAIL  service")]          # sources and versions: the services may still be starting
+    fatal = [l for l in text.splitlines() if l.startswith("  FAIL") and not l.startswith(("  FAIL  source", "  FAIL  service"))]
     if fatal:
         print(text)
         sys.exit("eaveswatch: fix what check says, then run this again (with --force)")
     print("check: the store, credentials and alerts are good")
     install_finial_unit(cfg_path, a.no_service, a.force)
-    rv = prof.get("reviewer")
     if a.no_reviewer or cfg["role"] != "finial":
         return
     if not rv:
-        print("no reviewer in the profile: start one with `eaveswatch URL MODEL` (it reuses this setup)")
+        print("no reviewer in the system's config: start one with `eaveswatch URL MODEL` (it reuses this setup)")
         return
     key = os.environ.get(rv.get("key_env") or "EAVESWATCH_MODEL_KEY")
     if not key:
@@ -3120,7 +3745,7 @@ def restore(argv: list[str]) -> None:
     if not hob:
         sys.exit("eaveswatch: the reviewer runs on hobkin, which isn't installed (pipx install hobkin-eaveswatch brings it)")
     start_reviewer(hob, cfg, cfg_path, rv["url"], rv["model"], key, a.no_service, False,
-                   "starting the reviewer (hobkin): it checks the restored setup against this box")
+                   "starting the reviewer (hobkin): it reviews what the system routes to this node")
 
 
 # ---- command line
@@ -3173,7 +3798,11 @@ def cli(argv: list[str] | None = None) -> None:
     f.add_argument("--all", action="store_true")
     sub.add_parser("check")
     sub.add_parser("iam")
-    sub.add_parser("save", help="save this system's profile to the store now (the loop does it when it changes)")
+    sub.add_parser("watch", help="for the reviewer's wake: this node's claimed review, answers, notes; or nothing")
+    jb = sub.add_parser("job", help="the reviewer's side of a review job")
+    jb.add_argument("action", choices=("done", "release", "list"))
+    jb.add_argument("id", nargs="?")
+    jb.add_argument("--note")
     nt = sub.add_parser("notify")
     nt.add_argument("text", nargs="*")
     nt.add_argument("--subject")
@@ -3188,8 +3817,8 @@ def cli(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv and (re.match(r"https?://", argv[0]) or argv[0] == "setup"):    # eaveswatch URL MODEL [KEY]: the one-line setup
         return setup(argv[1:] if argv[0] == "setup" else argv)
-    if argv and argv[0] == "restore":                  # a new instance, from its system's saved profile
-        return restore(argv[1:])
+    if argv and argv[0] == "join":                     # a new instance joins its system (an ASG's user-data)
+        return join(argv[1:])
     args = ap.parse_args(argv)
     if args.cmd == "chore":                   # needs no config
         try:
@@ -3206,9 +3835,30 @@ def cli(argv: list[str] | None = None) -> None:
         text, problems = run_check(cfg, args.config)
         print(text)
         sys.exit(1 if problems else 0)
-    if args.cmd == "save":
-        k = save_profile(cfg, os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json"))
-        print(f"saved {cfg['system']}'s profile: {k}" if k else "unchanged since the last save")
+    if args.cmd == "watch":
+        out = node_watch(cfg)
+        if out:
+            print(out)
+        return
+    if args.cmd == "job":
+        data = cfg["ridge"]["data"]
+        if args.action == "list":
+            for j in read_json(os.path.join(data, "state", "jobs.json"), []):
+                state = "done" if j.get("done") else f"claimed by {j['claim']['host']}" if j.get("claim") and \
+                    float(j["claim"].get("until", 0)) > time.time() else "open"
+                print(f"{j['id']} [{state}] {j.get('title')} (evidence: {j.get('affinity') or 'any'})")
+            return
+        if not args.id:
+            sys.exit("eaveswatch: job done|release ID")
+        if not os.path.exists(os.path.join(data, "jobs", "active", f"{args.id}.json")):
+            sys.exit(f"eaveswatch: job {args.id} isn't this node's (eaveswatch job list shows the system's)")
+        if args.action == "done":
+            write_json(os.path.join(data, "jobs", "done", f"{args.id}.json"), {"note": args.note, "at": iso(now_utc())})
+            print(f"job {args.id}: done (the loop tells the system within a minute)")
+        else:
+            os.makedirs(os.path.join(data, "jobs", "release"), exist_ok=True)
+            open(os.path.join(data, "jobs", "release", args.id), "w").close()
+            print(f"job {args.id}: given back (another node will take it)")
         return
     if args.cmd == "iam":
         if not cfg["store"].startswith("s3://"):
@@ -3243,39 +3893,29 @@ def cli(argv: list[str] | None = None) -> None:
                 (f" ({e.state.get('spool_error')})" if left else "")
         loop(cfg, args.once, eave_tick)
     elif args.cmd == "finial":
-        # one box: the eave sends to the store and to the ridge's inbox; asks are answered from the ridge's
-        # outbox; discovery runs now and then. The digest is the hobkin's (its wake runs `ridge watch`).
-        rd = Ridge(cfg)
-        e = Eave(cfg, inbox=rd.p("inbox"))
+        # every instance of a system runs this: its eave, its share of the system's state, the ridge duty when it
+        # holds the lease, and the reviews it claims. Discovery now and then; a clean stop gives everything back.
+        node = Node(cfg)
         last = {"discover": 0.0}
-        cfg_file = os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json")
 
         def finial_tick():
-            e.tick()
-            sent, left = e.last_flush
-            notes, _ = deliver_notes(cfg)
-            published = publish_report(cfg)
-            try:                                       # the system's profile, for its next instance
-                saved = save_profile(cfg, cfg_file, e.store)
-            except (OSError, urllib.error.URLError, ValueError) as err:
-                saved = None
-                print(f"eaveswatch: saving the profile: {err}", file=sys.stderr, flush=True)
-            msg = [f"notes sent: {notes}"] if notes and args.once else []
-            if published and args.once:
-                msg.append(f"findings page: {published}/index.html")
-            if saved and args.once:
-                msg.append(f"profile saved: {saved}")
             if time.time() - last["discover"] >= cfg["discover_every"]:
-                _, ch = run_discovery(cfg)
+                run_discovery(cfg)
                 last["discover"] = time.time()
-                if args.once:
-                    msg.append(f"discovered ({', '.join(ch) or 'no changes'})")
+            said = node.tick()
+            sent, left = node.eave.last_flush
             if args.once:
-                msg.append(f"sent {sent}, {left} waiting")
-            elif left:
-                msg.append(f"eaveswatch: {left} files waiting to send ({e.state.get('spool_error')})")
-            return "\n".join(msg)
-        loop(cfg, args.once, finial_tick)
+                return "\n".join(said + [f"sent {sent}, {left} waiting"])
+            return "\n".join(said + ([f"{left} files waiting to send ({node.eave.state.get('spool_error')})"] if left else []))
+
+        def stop(*_):
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stop)
+        try:
+            loop(cfg, args.once, finial_tick)
+        finally:
+            if not args.once:
+                node.leave()
     elif args.cmd == "ridge":
         rd = Ridge(cfg)
         if args.action == "watch":
