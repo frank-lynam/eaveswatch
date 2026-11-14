@@ -1,0 +1,21 @@
+# /etc/systemd/system/eaveswatch-eave.service  (the same unit runs a ridge's sync loop: "ridge" for "eave")
+[Unit]
+Description=eaveswatch eave: logs, inventory and connections to the store
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/eaveswatch --config /etc/eaveswatch.json eave
+# a user that can read the logs it watches (adm, systemd-journal) and nothing else
+User=eaveswatch
+SupplementaryGroups=adm systemd-journal
+StateDirectory=eaveswatch
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/eaveswatch
+
+[Install]
+WantedBy=multi-user.target

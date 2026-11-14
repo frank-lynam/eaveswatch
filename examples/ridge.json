@@ -1,0 +1,9 @@
+{
+  "role": "ridge",
+  "env": "prod",
+  "store": "s3://my-eaves-bucket/eaveswatch",
+  "region": "us-east-1",
+  "state_dir": "/var/lib/eaveswatch",
+  "every": 60,
+  "ridge": {"data": "/srv/eaveswatch-ridge", "envs": ["prod", "staging"], "silent_after": 7200}
+}
