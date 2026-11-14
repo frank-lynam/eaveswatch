@@ -13,6 +13,7 @@
     eaveswatch finding list [--all]             open findings (--all: every one)
     eaveswatch finding status ID STATUS [--why TEXT]    accepted, fixed, dismissed (with why), reopened
     eaveswatch key KIND [HOST]                  where a file of KIND from HOST would go now (to check a layout)
+    eaveswatch check                            is this host set up right? store, credentials, clock, sources, versions
     eaveswatch chore [DIR] [--force]            write the reviewer chore where hobkin finds it (~/.hobkins/_shared/chores)
 
 The store is a folder or s3://bucket/prefix. Files are gzipped JSON lines under Hive-style prefixes
@@ -32,6 +33,7 @@ host, before anything leaves it. Config: --config, else $EAVESWATCH_CONFIG, else
 #   eave         sources (files, journald), packets, baselines, inventory, flows, raw, answering asks
 #   ridge        sync (store -> data folder, asks -> store), the map, the digest (watch)
 #   findings     the ledger: add, seen again, status, list
+#   check        `eaveswatch check`: each role's permissions, sources, versions, clock, a preview
 #   the reviewer the hobkin chore (chore.json, CHORE.md), written out by `eaveswatch chore`
 #   command line
 from __future__ import annotations
@@ -81,7 +83,7 @@ DEFAULTS = {
     "ridge": {"data": None, "envs": None, "silent_after": 7200,    # data default: STATE_DIR/ridge
               "late_hours": 24, "late_every": 600},   # every late_every s, look this far back for late arrivals
 }
-KINDS = ("packets", "inventory", "flows", "raw", "requests", "answers")
+KINDS = ("packets", "inventory", "flows", "raw", "requests", "answers", "check")   # check: probes from `eaveswatch check`
 RIDGE_READS = ("packets", "inventory", "flows", "answers")     # never raw: the reviewer doesn't read the archive
 
 
@@ -246,10 +248,11 @@ class Credentials:
     instance's role (IMDSv2). Role credentials are fetched again before they expire."""
 
     def __init__(self):
-        self.cached, self.expires = None, 0.0
+        self.cached, self.expires, self.source = None, 0.0, None
 
     def get(self) -> tuple[str, str, str | None]:
         if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+            self.source = "environment (AWS_ACCESS_KEY_ID)"
             return os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"], os.environ.get("AWS_SESSION_TOKEN")
         if self.cached and time.time() < self.expires:
             return self.cached
@@ -258,11 +261,13 @@ class Credentials:
         ini.read(os.path.expanduser(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials")))
         if ini.has_section(prof) and ini.has_option(prof, "aws_access_key_id"):
             s = ini[prof]
+            self.source = f"profile {prof!r} in ~/.aws/credentials"
             self.cached, self.expires = (s["aws_access_key_id"], s["aws_secret_access_key"], s.get("aws_session_token")), time.time() + 300
             return self.cached
         rel = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
         if rel:
             c = json.load(urllib.request.urlopen("http://169.254.170.2" + rel, timeout=5))
+            self.source = "the container's task role (ECS)"
         else:
             tok = urllib.request.urlopen(urllib.request.Request(
                 "http://169.254.169.254/latest/api/token", method="PUT",
@@ -271,6 +276,7 @@ class Credentials:
             base = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
             role = urllib.request.urlopen(urllib.request.Request(base, headers=h), timeout=5).read().decode().split()[0]
             c = json.load(urllib.request.urlopen(urllib.request.Request(base + role, headers=h), timeout=5))
+            self.source = f"the instance role {role!r} (IMDSv2)"
         exp = dt.datetime.strptime(c["Expiration"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
         self.cached, self.expires = (c["AccessKeyId"], c["SecretAccessKey"], c.get("Token")), exp - 300
         return self.cached
@@ -286,6 +292,7 @@ class S3Store:
         self.region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
         self.endpoint = endpoint.rstrip("/") if endpoint else None
         self.creds = Credentials()
+        self.last_date = None              # the Date S3 last answered with: how far off this clock is
 
     def _full(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
@@ -307,8 +314,17 @@ class S3Store:
         qs = urllib.parse.urlencode(sorted(query.items()), quote_via=lambda v, *_: urllib.parse.quote(v, safe="-_.~"))
         req = urllib.request.Request(f"{scheme}://{host}{path}" + (f"?{qs}" if qs else ""), data=body if method == "PUT" else None,
                                      method=method, headers={k: v for k, v in headers.items() if k != "host"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return r.read()
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                self.last_date = r.headers.get("Date")
+                return r.read()
+        except urllib.error.HTTPError as e:
+            self.last_date = e.headers.get("Date") if e.headers else None
+            body = e.read().decode(errors="replace")
+            code = re.search(r"<Code>([^<]+)</Code>", body)
+            msg = re.search(r"<Message>([^<]+)</Message>", body)
+            raise urllib.error.HTTPError(e.url, e.code, f"{e.code} {code.group(1) if code else e.reason}"
+                                         + (f": {msg.group(1)}" if msg else ""), e.headers, None) from None
 
     def put(self, key: str, data: bytes) -> None:
         self._request("PUT", self._full(key), body=data)
@@ -368,6 +384,7 @@ TEMPLATE = [
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"), "<ip>"),
     (re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"), "<email>"),
     (re.compile(r"\b(?:0x)?(?=[0-9a-fA-F]*\d)[0-9a-fA-F]{8,}\b"), "<hex>"),
+    (re.compile(r"\b(?=[\w-]*\d)(?=[\w-]*[A-Za-z])[\w-]{20,}\b"), "<id>"),      # long mixed ids: sessions, requests
     (re.compile(r"\"[^\"\n]{0,200}\""), "\"<str>\""),
     (re.compile(r"(?<![\w<])[-+]?\d+(?:\.\d+)?(?:ms|s|kb|mb|gb|b)?\b", re.I), "<n>"),
 ]
@@ -376,9 +393,13 @@ LEVELS = {"emerg": "error", "alert": "error", "crit": "error", "critical": "erro
           "error": "error", "warn": "warn", "warning": "warn", "notice": "info", "info": "info", "debug": "debug", "trace": "debug"}
 
 
+CONTROL = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|[\x00-\x08\x0b-\x1f\x7f]")
+
+
 def template(line: str) -> str:
-    """A log line with what varies (times, ids, addresses, numbers, quoted values) replaced by placeholders."""
-    t = line.strip()
+    """A log line with what varies (times, ids, addresses, numbers, quoted values) replaced by placeholders, and
+    terminal escapes and control characters dropped (a coloured line is the same line)."""
+    t = CONTROL.sub("", line).strip()
     for pat, rep in TEMPLATE:
         t = pat.sub(rep, t)
     return re.sub(r"\s+", " ", t)[:300]
@@ -1162,6 +1183,207 @@ def install_chore(dest: str | None, force: bool) -> str:
     return d
 
 
+# ---- check: is this host (or ridge) set up right? Each role's own permissions, its sources, its clock
+class Check:
+    def __init__(self):
+        self.lines, self.problems = [], 0
+
+    def ok(self, what: str, detail: str = "") -> None:
+        self.lines.append(f"  ok    {what}" + (f": {detail}" if detail else ""))
+
+    def info(self, what: str, detail: str = "") -> None:
+        self.lines.append(f"  info  {what}" + (f": {detail}" if detail else ""))
+
+    def warn(self, what: str, detail: str = "") -> None:
+        self.lines.append(f"  warn  {what}" + (f": {detail}" if detail else ""))
+
+    def fail(self, what: str, detail: str, fix: str = "") -> None:
+        self.problems += 1
+        self.lines.append(f"  FAIL  {what}: {detail}" + (f"\n        fix: {fix}" if fix else ""))
+
+
+def check_store(c: Check, cfg: dict, store, role: str) -> None:
+    """The store, with exactly what this role does: an eave writes under its own host and lists its asks; a
+    ridge lists and reads what it syncs and writes asks. Probes go to kind=check (nothing reads it; a lifecycle
+    rule can expire it)."""
+    if isinstance(store, S3Store):
+        try:
+            key_id = store.creds.get()[0]
+            c.ok("credentials", f"{store.creds.source} (key {key_id[:4]}…{key_id[-4:]})")
+        except (OSError, urllib.error.URLError, ValueError, KeyError, IndexError) as e:
+            c.fail("credentials", f"none found ({e})", "an instance or task role, a profile in ~/.aws/credentials, "
+                   "or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the service's environment")
+            return
+    t = now_utc()
+    probe = object_key(cfg["env"], "check", cfg["host"], t)
+
+    def step(what, fn, fix):
+        try:
+            return True, fn()
+        except (OSError, urllib.error.URLError, ValueError, KeyError, ET.ParseError) as e:
+            c.fail(f"store: {what}", str(getattr(e, "reason", e)), fix)
+            return False, None
+    ok, _ = step("write", lambda: store.put(probe, pack([{"check": True, "host": cfg["host"], "at": iso(t),
+                                                           "eaveswatch": __version__}])),
+                 f"allow s3:PutObject on {cfg['store']}/*/host={cfg['host']}/*")
+    if ok:
+        c.ok("store: write", probe)
+    if role in ("eave", "local"):
+        pre = hour_prefix(cfg["env"], "requests", t) + f"host={cfg['host']}/"
+        ok, keys = step("list asks", lambda: store.list(pre),
+                        f"allow s3:ListBucket with s3:prefix {cfg['store']}/env={cfg['env']}/kind=requests/*")
+        if ok:
+            c.ok("store: list asks", f"{len(keys)} this hour")
+    if role in ("ridge", "local"):
+        for env in [safe_name(e) for e in (cfg["ridge"]["envs"] or [cfg["env"]])]:
+            for kind in RIDGE_READS:
+                ok, keys = step(f"list {env}/{kind}", lambda: store.list(hour_prefix(env, kind, t)),
+                                f"allow s3:ListBucket with s3:prefix {cfg['store']}/env={env}/kind={kind}/*")
+                if not ok:
+                    continue
+                if keys:
+                    got, _ = step(f"read {env}/{kind}", lambda: store.get(keys[-1]),
+                                  f"allow s3:GetObject on {cfg['store']}/env={env}/kind={kind}/*")
+                    if got:
+                        c.ok(f"store: {env}/{kind}", f"{len(keys)} files this hour, read the newest")
+                else:
+                    c.info(f"store: {env}/{kind}", "listed; nothing this hour yet (is an eave running?)")
+    if isinstance(store, S3Store) and store.last_date:
+        try:
+            skew = (now_utc() - dt.datetime.strptime(store.last_date, "%a, %d %b %Y %H:%M:%S GMT")
+                    .replace(tzinfo=dt.timezone.utc)).total_seconds()
+            said = f"{abs(skew):.0f}s {'ahead of' if skew > 0 else 'behind'} S3"
+            if abs(skew) < 60:
+                c.ok("clock", said)
+            elif abs(skew) < 300:
+                c.warn("clock", said)
+            else:
+                c.fail("clock", said, "S3 refuses requests over 15 minutes off: run chrony or systemd-timesyncd")
+        except ValueError:
+            pass
+
+
+def check_sources(c: Check, cfg: dict, redact) -> dict:
+    """Every source readable, and what its recent lines would look like (read here, sent nowhere)."""
+    preview, hidden = {}, 0
+    for src in cfg["sources"]:
+        name = src.get("name") or "?"
+        if src.get("journald"):
+            units = src.get("units") or [None]
+            try:
+                r = subprocess.run(["journalctl", "-o", "cat", "--no-pager", "-n", "200"]
+                                   + sum((["-u", u] for u in units if u), []), capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as e:
+                c.fail(f"source {name}", f"can't run journalctl ({e})", "install systemd's journalctl, or drop this source")
+                continue
+            if "insufficient permissions" in r.stderr or "No journal files were opened" in r.stderr:
+                c.fail(f"source {name}", "journald won't show this user the logs",
+                       "add the eave's user to the systemd-journal (or adm) group")
+                continue
+            lines = r.stdout.splitlines()
+            (c.ok if lines else c.warn)(f"source {name}", f"journald, {len(lines)} recent lines"
+                                        + (f" ({', '.join(u for u in units if u)})" if any(units) else ""))
+        elif src.get("path"):
+            paths = sorted(glob.glob(os.path.expanduser(src["path"])))
+            if not paths:
+                c.fail(f"source {name}", f"{src['path']} matches no files", "check the glob, or that the logs exist on this host")
+                continue
+            lines, unreadable = [], []
+            for p in paths:
+                try:
+                    with open(p, "rb") as f:
+                        start = max(os.path.getsize(p) - 65536, 0)
+                        f.seek(start)
+                        got = f.read().decode(errors="replace").splitlines()
+                        lines += got[1:] if start else got      # a partial first line, after a seek into the middle
+                except OSError:
+                    unreadable.append(p)
+            if unreadable:
+                c.fail(f"source {name}", f"can't read {', '.join(unreadable[:3])}",
+                       "add the eave's user to the group that owns them (often adm)")
+            if len(unreadable) < len(paths):
+                newest = max(os.path.getmtime(p) for p in paths)
+                age = time.time() - newest
+                (c.ok if age < 86400 else c.warn)(f"source {name}", f"{len(paths)} files, newest written {span(age)} ago")
+        else:
+            c.fail(f"source {name}", "has neither a path nor journald: true", 'give it "path": "/var/log/x/*.log"')
+            continue
+        base = name.split(":")[0]
+        for line in lines[-2000:]:
+            red = redact(line)
+            hidden += red.count("<redacted")
+            tmpl = template(red)
+            e = preview.setdefault((base, fingerprint(base, tmpl)), {"source": base, "template": tmpl, "count": 0, "sample": red})
+            e["count"] += 1
+    return {"templates": sorted(preview.values(), key=lambda e: -e["count"]), "redacted": hidden}
+
+
+def span(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s}s" if s < 120 else f"{s // 60}m" if s < 7200 else f"{s // 3600}h" if s < 172800 else f"{s // 86400}d"
+
+
+def run_check(cfg: dict, path: str | None, store=None) -> tuple[str, int]:
+    """What `eaveswatch check` prints, and how many problems it found."""
+    c, role = Check(), cfg["role"]
+    if role not in ("eave", "ridge", "local"):
+        c.fail("config", f"role is {role!r}", "role is eave, ridge or local")
+        role = "eave"
+    c.ok("config", f"{path or os.environ.get('EAVESWATCH_CONFIG') or 'eaveswatch.json'} (role {role}, env {cfg['env']}, "
+         f"host {cfg['host']})")
+    for d, what in ([(cfg["state_dir"], "state dir")] + ([(cfg["ridge"]["data"], "ridge data")] if role in ("ridge", "local") else [])):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, f".check{os.getpid()}")
+            open(probe, "w").close()
+            os.remove(probe)
+            c.ok(what, f"{d} (writable)")
+        except OSError as e:
+            c.fail(what, f"{d} isn't writable ({e.strerror})", f"create it for this user (StateDirectory= in the unit does)")
+    if role in ("eave", "local"):
+        files = Eave.spooled(type("E", (), {"spool_dir": lambda self: os.path.join(cfg["state_dir"], "spool")})())
+        if files:
+            c.warn("spool", f"{len(files)} files waiting to send, oldest {files[0][0]}")
+    check_store(c, cfg, store or open_store(cfg), role)
+    preview = {"templates": [], "redacted": 0}
+    if role in ("eave", "local"):
+        if not cfg["sources"]:
+            c.warn("sources", "none configured: this eave sends inventory and flows only")
+        preview = check_sources(c, cfg, redactor(cfg["redact"]))
+        for name, svc in (cfg["services"] or {}).items():
+            d = os.path.expanduser(svc.get("dir", ""))
+            sha = git_head(d) if d else ""
+            if not sha and svc.get("version_file"):
+                try:
+                    sha = open(os.path.expanduser(svc["version_file"])).read().strip()
+                except OSError:
+                    pass
+            if sha:
+                c.ok(f"service {name}", f"version {sha[:12]}")
+            else:
+                c.fail(f"service {name}", f"no version: {d or svc.get('version_file')} isn't a git checkout (or readable)",
+                       'point "dir" at the deployed checkout, or "version_file" at a file holding the SHA')
+        tied = {s.get("service") for s in cfg["sources"]} - {None}
+        for svc in sorted(tied - set(cfg["services"] or {})):
+            c.fail(f"service {svc}", "a source names it, but it isn't in \"services\"", f'add "services": {{"{svc}": {{"dir": ...}}}}')
+        fl = parse_ss(run(["ss", "-Htunap"]), cfg["host"])
+        if fl["listening"] or fl["edges"]:
+            c.ok("flows", f"{len(fl['listening'])} listening, {len(fl['edges'])} connections"
+                 + ("" if any(e.get("process") for e in fl["edges"] + fl["listening"]) else " (no process names: those need root)"))
+        else:
+            c.warn("flows", "ss shows nothing (is iproute2 installed?)")
+        c.info("units", f"{len(run(['systemctl', 'list-units', '--type=service', '--state=running', '--no-legend']).splitlines())} running")
+    out = [f"eaveswatch check: {role} {cfg['host']}, env {cfg['env']}, store {cfg['store']}"] + c.lines
+    if preview["templates"]:
+        out.append(f"\npreview: the recent lines of each source as templates (read here, sent nowhere); "
+                   f"{preview['redacted']} values redacted")
+        for e in preview["templates"][:12]:
+            out.append(f"  {e['count']:>5}x  [{e['source']}] {e['template'][:110]}")
+        out.append(f"  ({len(preview['templates'])} templates in all; an eave sends counts like these, plus a few redacted samples)")
+    out.append(f"\n{c.problems} problem{'' if c.problems == 1 else 's'}" if c.problems else "\nall good")
+    return "\n".join(out), c.problems
+
+
 # ---- command line
 def loop(cfg: dict, once: bool, *steps) -> None:
     while True:
@@ -1203,6 +1425,7 @@ def cli(argv: list[str] | None = None) -> None:
     f.add_argument("status", nargs="?")
     f.add_argument("--why")
     f.add_argument("--all", action="store_true")
+    sub.add_parser("check")
     c = sub.add_parser("chore")
     c.add_argument("dest", nargs="?")
     c.add_argument("--force", action="store_true")
@@ -1218,6 +1441,10 @@ def cli(argv: list[str] | None = None) -> None:
         print(f"wrote the reviewer chore to {d}\ngive it to a hobkin: hobkin --chore eaveswatch --set config=... --set data=... --safe")
         return
     cfg = load_config(args.config)
+    if args.cmd == "check":
+        text, problems = run_check(cfg, args.config)
+        print(text)
+        sys.exit(1 if problems else 0)
     if args.cmd == "key":
         print(object_key(cfg["env"], args.kind, safe_name(args.host or cfg["host"]), now_utc()))
     elif args.cmd == "eave":

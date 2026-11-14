@@ -75,6 +75,26 @@ python3 eaveswatch.py ridge watch         # the digest: what's new (nothing new:
 An eave spends its first hour (`warmup_minutes`) learning what's usual, so
 nothing is flagged "new" until then.
 
+## Check a host
+
+```sh
+eaveswatch --config /etc/eaveswatch.json check      # run it as the service's user: sudo -u eaveswatch ...
+```
+
+It checks what this role does in production, no more:
+- **An eave:** writes a probe under its own host, and lists its asks.
+- **A ridge:** lists and reads every kind it syncs.
+
+It also says where the credentials came from (the key masked), how far this
+clock is from S3's (S3 refuses requests more than 15 minutes off), whether
+every source is readable (journald group membership included), and whether
+every service's version resolves. Each failure comes with its fix: S3's own
+reason ("403 AccessDenied") and the exact permission to add. Then it shows a
+preview of the recent lines as templates, with how many values it redacted.
+That's how you check secrets are caught before anything is sent. The exit
+code is 1 if anything failed, for deploy scripts. Probes go to `kind=check`,
+which nothing reads: a lifecycle rule can expire it after a day.
+
 ## A fleet
 
 On every host: copy `eaveswatch.py` to `/usr/local/bin/eaveswatch` (or `pipx
@@ -106,8 +126,8 @@ On the ridge, two pieces, deliberately apart:
 
 | Who | Allow |
 |---|---|
-| eave `web-3` | `s3:PutObject` on `PREFIX/*/host=web-3/*`; `s3:ListBucket` with `s3:prefix` `PREFIX/env=prod/kind=requests/*`; `s3:GetObject` on `PREFIX/env=*/kind=requests/*/host=web-3/*` |
-| ridge sync | `s3:ListBucket` and `s3:GetObject` on `kind=packets`, `inventory`, `flows`, `answers`; `s3:PutObject` on `kind=requests` |
+| eave `web-3` | `s3:PutObject` on `PREFIX/*/host=web-3/*` (its data, answers and `check` probes); `s3:ListBucket` with `s3:prefix` `PREFIX/env=prod/kind=requests/*`; `s3:GetObject` on `PREFIX/env=*/kind=requests/*/host=web-3/*` |
+| ridge sync | `s3:ListBucket` and `s3:GetObject` on `kind=packets`, `inventory`, `flows`, `answers`; `s3:PutObject` on `kind=requests` and `kind=check` |
 | ridge, never | `kind=raw` (the archive is for people; the reviewer asks an eave for lines instead) |
 
 ## What the reviewer does

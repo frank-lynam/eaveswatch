@@ -31,6 +31,9 @@ for raw, want in [("GET /x?token=abc123&u=1", "GET /x?token=<redacted>&u=1"),
 t = ew.template('2026-11-14T09:15:02Z ERROR user 4f2a9c1b-1111-2222-3333-444455556666 from 10.0.3.4:5532 took 532ms "GET /a" id=0xdeadbeef9')
 check("[text] a template keeps the words and drops what varies",
       t == '<ts> ERROR user <uuid> from <ip> took <n> "<str>" id=<hex>', t)
+check("[text] terminal colours and escapes are dropped, long mixed ids are placeholders",
+      ew.template("\x1b[32mok\x1b[0m \x1b]8;;https://x\x07link\x1b]8;;\x07 session_01U5HvRjSMeaGk45FYMcmCk4 done")
+      == "ok link <id> done", ew.template("\x1b[32mok\x1b[0m \x1b]8;;https://x\x07link\x1b]8;;\x07 session_01U5HvRjSMeaGk45FYMcmCk4 done"))
 check("[text] the same shape is the same fingerprint, per source",
       ew.fingerprint("api", ew.template("took 5ms")) == ew.fingerprint("api", ew.template("took 900ms"))
       and ew.fingerprint("api", "x") != ew.fingerprint("web", "x"))
@@ -182,9 +185,15 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
         if self.headers.get("Authorization") != want:
             FakeS3.bad.append(self.path)
 
+    deny_put = False
+
     def do_PUT(self):
         body = self.rfile.read(int(self.headers["content-length"]))
         self.verify(body)
+        if FakeS3.deny_put:
+            err = b"<?xml version='1.0'?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+            self.send_response(403); self.send_header("content-length", str(len(err))); self.end_headers(); self.wfile.write(err)
+            return
         FakeS3.objects[urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)] = body
         self.send_response(200); self.end_headers()
 
@@ -216,6 +225,23 @@ os.environ.pop("AWS_SESSION_TOKEN", None)
 s3 = ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}")
 round_trip("s3", "s3://bucket/eaves/v1", s3)
 check("[s3] every request's signature matches the URL it went to (prefixes with / and = included)", not FakeS3.bad, FakeS3.bad[:3])
+s3cfg = {**ew.DEFAULTS, "store": "s3://bucket/eaves/v1", "env": "test", "host": "web-7", "role": "eave",
+         "state_dir": tempfile.mkdtemp(prefix="eaveswatch-check-"), "sources": [], "ridge": dict(ew.DEFAULTS["ridge"], data=None)}
+s3cfg["ridge"]["data"] = os.path.join(s3cfg["state_dir"], "ridge")
+text, problems = ew.run_check(s3cfg, "test.json", s3)
+check("[check] an eave on S3: where its credentials came from (key masked), a probe under its own host, its asks, the clock",
+      problems == 0 and "credentials: environment (AWS_ACCESS_KEY_ID) (key AKID…TEST)" in text
+      and "store: write: env=test/kind=check/" in text and "host=web-7/" in text and "list asks" in text
+      and re.search(r"ok    clock: \d+s", text) and "secret" not in text, text)
+FakeS3.deny_put = True
+text, problems = ew.run_check(s3cfg, "test.json", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
+FakeS3.deny_put = False
+check("[check] S3 refusing says S3's own reason and the permission to add",
+      problems == 1 and "FAIL  store: write: 403 AccessDenied: Access Denied" in text
+      and "fix: allow s3:PutObject on s3://bucket/eaves/v1/*/host=web-7/*" in text, text)
+rd_text, rd_problems = ew.run_check({**s3cfg, "role": "ridge"}, "test.json", s3)
+check("[check] a ridge on S3: lists and reads each kind it syncs", rd_problems == 0
+      and all(f"test/{k}" in rd_text for k in ("packets", "inventory", "flows", "answers")), rd_text)
 check("[s3] objects land under the bucket's prefix", all(k.startswith("/bucket/eaves/v1/env=test/kind=") for k in FakeS3.objects),
       list(FakeS3.objects)[:3])
 
@@ -290,6 +316,25 @@ rd.watch()
 check("[ridge] fetched files are remembered by the data folder itself (archived ones too)",
       rd.have(late) and rd.sync(deep=True) == 0)
 
+# ---- check on a folder store: a good eave, then the usual mistakes
+cbase, clogs, ccfgs = setup(tempfile.mkdtemp(prefix="eaveswatch-check-store-"))
+good_cfg = ccfgs["web-1"]
+write(f"{clogs}/web-1.log", ["INFO request ok in 12ms token=abc123secret", "INFO request ok in 15ms"])
+text, problems = ew.run_check(good_cfg, "good.json")
+check("[check] a good eave: all ok, a preview of its templates, redaction counted, nothing sent but the probe",
+      problems == 0 and "all good" in text and "1x  [app] INFO request ok in <n>\n" in text
+      and "1x  [app] INFO request ok in <n> token=<redacted>" in text and "1 values redacted" in text
+      and "abc123secret" not in text and not [k for k in ew.FolderStore(good_cfg["store"]).list("") if "kind=check" not in k], text)
+bad = {**good_cfg, "sources": good_cfg["sources"] + [{"name": "nginx", "path": "/nonexistent/*.log"},
+                                                     {"name": "odd"}, {"name": "db", "path": f"{clogs}/web-1.log", "service": "db"}],
+       "services": {**good_cfg["services"], "worker": {"dir": "/nonexistent"}}}
+text, problems = ew.run_check(bad, "bad.json")
+check("[check] the usual mistakes, each with its fix: a glob matching nothing, a source with no path, "
+      "a service that isn't a checkout, a source tied to an unknown service",
+      problems == 4 and "FAIL  source nginx: /nonexistent/*.log matches no files" in text
+      and "FAIL  source odd: has neither a path nor journald" in text and "FAIL  service worker: no version" in text
+      and "FAIL  service db: a source names it" in text and text.count("fix: ") == 4 and text.endswith("4 problems"), text)
+
 # ---- findings
 cfg = cfgs["web-1"]
 good = {"category": "security/authz", "location": "api src/auth.py:88", "claim": "c", "evidence": "e", "scenario": "s",
@@ -324,6 +369,15 @@ check("[cli] key prints where a file would go", re.match(r"env=test/kind=flows/d
       out.stdout + out.stderr)
 out = subprocess.run([sys.executable, os.path.join(HERE, "..", "eaveswatch.py"), "--config", cfg_path, "ridge", "watch"],
                      capture_output=True, text=True)
+chk = subprocess.run([sys.executable, os.path.join(HERE, "..", "eaveswatch.py"), "--config", cfg_path, "check"],
+                     capture_output=True, text=True)
+json.dump({"store": os.path.join(base, "store"), "state_dir": os.path.join(base, "cli"), "host": "cli-1",
+           "sources": [{"name": "x", "path": "/nonexistent/*"}]}, open(cfg_path + ".bad", "w"))
+bad_chk = subprocess.run([sys.executable, os.path.join(HERE, "..", "eaveswatch.py"), "--config", cfg_path + ".bad", "check"],
+                         capture_output=True, text=True)
+check("[cli] check exits 0 when all's well, 1 with a problem (for scripts and deploys)",
+      chk.returncode == 0 and "all good" in chk.stdout and bad_chk.returncode == 1 and "1 problem" in bad_chk.stdout,
+      chk.stdout[-300:] + bad_chk.stdout[-300:])
 check("[cli] ridge watch with nothing new prints nothing (a quiet wake)", out.returncode == 0 and out.stdout == "", out.stdout + out.stderr)
 
 chores = tempfile.mkdtemp(prefix="eaveswatch-chores-")
