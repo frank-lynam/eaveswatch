@@ -577,5 +577,34 @@ check("[chore] eaveswatch chore writes the reviewer chore: its full command path
 again = cli("chore", chores)
 check("[chore] an installed chore isn't replaced without --force", again.returncode != 0 and "--force" in again.stderr, again.stderr)
 
+# ---- setup: one command (here: a folder store, no services, a stand-in hobkin that records what it's given)
+sh = tempfile.mkdtemp(prefix="eaveswatch-setup-")
+rec = os.path.join(sh, "hobkin-args.json")
+open(os.path.join(sh, "fake_hobkin.py"), "w").write("import json,sys; json.dump(sys.argv[1:], open(sys.argv[0] + '.out', 'w'))")
+senv = {**os.environ, "HOME": sh, "HOBKIN_HOME": os.path.join(sh, ".hobkins"),
+        "EAVESWATCH_HOBKIN": f"{sys.executable} {os.path.join(sh, 'fake_hobkin.py')}"}
+srun = lambda *a: subprocess.run([sys.executable, EW] + list(a), capture_output=True, text=True, env=senv, stdin=subprocess.DEVNULL)
+o1 = srun("https://api.example.test/v1", "some-model", "sk-test", "--store", os.path.join(sh, "store"), "--no-service")
+got = json.load(open(os.path.join(sh, "fake_hobkin.py.out"))) if os.path.exists(os.path.join(sh, "fake_hobkin.py.out")) else []
+scfg = json.load(open(os.path.join(sh, ".config", "eaveswatch", "finial.json"))) if o1.returncode == 0 else {}
+check("[setup] eaveswatch URL MODEL KEY: a finial config, check run, the chore installed, then hobkin's own setup with the chore",
+      o1.returncode == 0 and scfg.get("role") == "finial" and scfg.get("state_dir") == "~/eaveswatch"
+      and "check: all good" in o1.stdout and os.path.isdir(os.path.join(sh, "eaveswatch", "ridge"))
+      and os.path.exists(os.path.join(sh, ".hobkins", "_shared", "chores", "eaveswatch", "chore.json"))
+      and got[:3] == ["https://api.example.test/v1", "some-model", "sk-test"]
+      and got[3:5] == ["--chore", "eaveswatch"] and f"data={os.path.join(sh, 'eaveswatch', 'ridge')}" in got
+      and "--safe" in got and "--chat" in got and "--no-service" in got and any(x.startswith("command=") for x in got),
+      o1.stdout + o1.stderr + json.dumps(got))
+o2 = srun("https://api.example.test/v1", "some-model", "--no-service", "--no-chat")
+check("[setup] run again, it uses the setup there is", o2.returncode == 0 and "using " in o2.stdout, o2.stdout + o2.stderr)
+o3 = srun("https://api.example.test/v1", "some-model", "--store", os.path.join(sh, "other"), "--no-service")
+check("[setup] a different store isn't put over an existing setup without --force",
+      o3.returncode != 0 and "--force replaces it" in o3.stderr, o3.stderr)
+fresh = tempfile.mkdtemp(prefix="eaveswatch-setup2-")
+o4 = subprocess.run([sys.executable, EW, "https://api.example.test/v1", "some-model", "--no-service"], capture_output=True,
+                    text=True, stdin=subprocess.DEVNULL, env={**senv, "HOME": fresh, "AWS_REGION": "us-east-1"})
+check("[setup] with no bucket and nobody to ask (no terminal), it says to give --bucket, and writes nothing",
+      o4.returncode != 0 and "--bucket" in o4.stderr and not os.path.exists(os.path.join(fresh, ".config", "eaveswatch")), o4.stderr)
+
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
 sys.exit(1 if FAILED else 0)

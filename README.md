@@ -44,28 +44,38 @@ a finding, and a ledger that traces every conclusion back to its evidence.
 
 ## A finial: one box, watched from the inside
 
-Run it as **the same user the watched services run as**, with those services as
-user systemd units. Linux lets that user see its own processes' open files,
-sockets and environment, so discovery needs no root and no extra
-capabilities.
+As **the same user the watched services run as** (with those services as user
+systemd units), run:
 
 ```sh
-pipx install hobkin-eaveswatch                     # or copy eaveswatch.py to ~/.local/bin/eaveswatch
-mkdir -p ~/.config/eaveswatch
-cp examples/finial/finial.json ~/.config/eaveswatch/                 # set the bucket, region, host name
-eaveswatch --config ~/.config/eaveswatch/finial.json check           # store, credentials, clock: fix what it says
-cp examples/finial/eaveswatch-finial.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now eaveswatch-finial
-loginctl enable-linger "$USER"                     # once: user units run with nobody logged in
-
-eaveswatch chore                                   # the reviewer chore, with this eaveswatch's full path
-hobkin URL MODEL KEY --chore eaveswatch --id eaveswatch --safe --chat \
-  --set config=~/.config/eaveswatch/finial.json --set data=~/eaveswatch/ridge
+pipx install hobkin-eaveswatch          # brings hobkin too
+eaveswatch https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-...    # the reviewer's model API
 ```
 
-The data folder isn't under a dot-folder on purpose: hobkin's safe mode
-refuses write folders inside `~/.something`, because those are ways out of the
-sandbox. Start the finial before the hobkin; its first tick creates the folder.
+Running as that user lets discovery see the services' own open files,
+sockets and environment, with no root and no extra capabilities.
+
+The one command asks which S3 bucket to use (showing the ones it can see).
+Everything else is decided for you:
+- **Region:** the bucket's own.
+- **Credentials:** the instance profile.
+- **Host:** the hostname.
+- **Config:** `~/.config/eaveswatch/finial.json`.
+- **State:** `~/eaveswatch`. It isn't under a dot-folder on purpose: hobkin's
+  safe mode refuses write folders inside `~/.something`, because those are
+  ways out of the sandbox.
+
+It runs `check`, installs and starts the `eaveswatch-finial` user service,
+turns on lingering (so the services run with nobody logged in), installs the
+reviewer chore, and hands over to hobkin. You end up in a chat with the
+reviewer. Run it again later and it reuses the same setup.
+
+Options:
+- `--bucket NAME`, so nothing is asked
+- `--store s3://bucket/prefix`, or a folder to try it without S3
+- `--env`, `--host`
+- `--no-service`, `--no-chat`
+- `--force` (replace an existing setup)
 
 The reviewer then:
 1. runs `discover`

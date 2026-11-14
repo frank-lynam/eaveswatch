@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """eaveswatch: logs, inventory and connections from every host, interpreted by a hobkin and reviewed by one.
 
+    eaveswatch URL MODEL [KEY]        set this box up as a finial and start its reviewer, in one go (asks for a bucket)
     eaveswatch eave   [--once]        on a host: its interpreter's sources -> templates and counts; inventory, flows;
                                       all spooled, then sent to the store; answers the ridge's asks
     eaveswatch ridge  [sync] [--once] the hub's loop (no model): new files from the store -> the data folder
@@ -41,6 +42,7 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   findings     the ledger: add, seen again, status, list
 #   the reviewer the hobkin chore (chore.json, CHORE.md), written out by `eaveswatch chore`
 #   check        `eaveswatch check`: each role's permissions, the interpreter, sources, versions, clock, a preview
+#   setup        `eaveswatch URL MODEL [KEY]`: a finial in one command, then hobkin's own setup with the chore
 #   command line
 from __future__ import annotations
 
@@ -2131,6 +2133,15 @@ decide.
 """
 
 
+def eaveswatch_cmd() -> str:
+    """How to run this same eaveswatch from a service: the installed command's full path, else this file with
+    this Python."""
+    me = os.path.realpath(sys.argv[0])
+    if os.path.basename(sys.argv[0]) == "eaveswatch" and os.access(me, os.X_OK):
+        return me
+    return shutil.which("eaveswatch") or f"{sys.executable} {os.path.abspath(__file__)}"
+
+
 def install_chore(dest: str | None, force: bool) -> str:
     """Write the reviewer chore (chore.json, CHORE.md) into DEST/eaveswatch; default: where hobkin looks for
     chores by name (~/.hobkins/_shared/chores, or $HOBKIN_HOME's). An existing one is kept unless `force`."""
@@ -2140,9 +2151,7 @@ def install_chore(dest: str | None, force: bool) -> str:
         raise ValueError(f"{d} already has the chore (--force replaces it)")
     os.makedirs(d, exist_ok=True)
     chore = json.loads(json.dumps(CHORE_JSON))
-    me = os.path.realpath(sys.argv[0]) if os.path.basename(sys.argv[0]) == "eaveswatch" else None
-    cmd = me or shutil.which("eaveswatch") or f"{sys.executable} {os.path.abspath(__file__)}"
-    chore["settings"]["command"]["default"] = cmd           # its full path: a service's PATH is short
+    chore["settings"]["command"]["default"] = eaveswatch_cmd()   # its full path: a service's PATH is short
     with open(os.path.join(d, "chore.json"), "w") as f:
         json.dump(chore, f, indent=2)
         f.write("\n")
@@ -2350,6 +2359,153 @@ def run_check(cfg: dict, path: str | None, store=None) -> tuple[str, int]:
     return "\n".join(out), c.problems
 
 
+# ---- setup: one command for a finial. Everything but the bucket is decided: the box's own user, its hostname,
+# fixed folders, the instance's credentials and region. Then hobkin's own one-line setup, with the chore.
+SETUP_CONFIG = "~/.config/eaveswatch/finial.json"
+SETUP_STATE = "~/eaveswatch"                      # not under a dot-folder: hobkin's safe mode won't write there
+FINIAL_UNIT = """[Unit]
+Description=eaveswatch finial: this box's logs, interpreted, to the store and the reviewer
+After=network-online.target
+
+[Service]
+ExecStart={cmd} --config {config} finial
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def imds_region() -> str | None:
+    try:
+        tok = urllib.request.urlopen(urllib.request.Request("http://169.254.169.254/latest/api/token", method="PUT",
+                                     headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"}), timeout=2).read().decode()
+        return urllib.request.urlopen(urllib.request.Request("http://169.254.169.254/latest/meta-data/placement/region",
+                                      headers={"X-aws-ec2-metadata-token": tok}), timeout=2).read().decode().strip() or None
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+
+
+def bucket_region(bucket: str) -> str | None:
+    """Where a bucket lives: S3 says so in a header on any answer to a HEAD, a refusal included (no credentials needed)."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"https://{bucket}.s3.amazonaws.com/", method="HEAD"), timeout=10) as r:
+            return r.headers.get("x-amz-bucket-region")
+    except urllib.error.HTTPError as e:
+        return e.headers.get("x-amz-bucket-region") if e.headers else None
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+
+
+def list_buckets(region: str) -> list[str]:
+    """The buckets these credentials can see (to offer at setup); [] if they can't list them."""
+    try:
+        creds = Credentials()
+        key_id, secret, token = creds.get()
+        host = f"s3.{region}.amazonaws.com"
+        amz = stamp(now_utc())
+        payload = hashlib.sha256(b"").hexdigest()
+        h = {"host": host, "x-amz-date": amz, "x-amz-content-sha256": payload, **({"x-amz-security-token": token} if token else {})}
+        h["Authorization"] = sign_v4("GET", host, "/", {}, h, payload, region, "s3", key_id, secret, amz)
+        req = urllib.request.Request(f"https://{host}/", headers={k: v for k, v in h.items() if k != "host"})
+        body = urllib.request.urlopen(req, timeout=15).read().decode()
+        return re.findall(r"<Name>([^<]+)</Name>", body)
+    except (OSError, urllib.error.URLError, ValueError, KeyError, IndexError):
+        return []
+
+
+def hobkin_cmd() -> list[str] | None:
+    """How to run hobkin: $EAVESWATCH_HOBKIN (tests), the hobkin installed beside us, or one on PATH."""
+    if os.environ.get("EAVESWATCH_HOBKIN"):
+        return os.environ["EAVESWATCH_HOBKIN"].split()
+    try:
+        import hobkin                              # installed with us (a dependency): run its file with this Python
+        return [sys.executable, os.path.abspath(hobkin.__file__)]
+    except ImportError:
+        found = shutil.which("hobkin")
+        return [found] if found else None
+
+
+def setup(argv: list[str]) -> None:
+    ap = argparse.ArgumentParser(prog="eaveswatch", description="Set this box up as a finial and start its reviewer: "
+                                 "eaveswatch URL MODEL [KEY] (the model API the reviewer uses, as for hobkin).")
+    ap.add_argument("url")
+    ap.add_argument("model")
+    ap.add_argument("key", nargs="?")
+    ap.add_argument("--bucket", help="the S3 bucket for the archive (asked for if not given)")
+    ap.add_argument("--store", help="instead of --bucket: s3://bucket/prefix, or a folder")
+    ap.add_argument("--env", default="prod")
+    ap.add_argument("--host")
+    ap.add_argument("--no-service", action="store_true", help="don't install user services (run them yourself)")
+    ap.add_argument("--no-chat", action="store_true", help="don't open a chat with the reviewer at the end")
+    ap.add_argument("--force", action="store_true", help="replace an existing config or unit")
+    a = ap.parse_args(argv)
+    cfg_path = os.path.expanduser(SETUP_CONFIG)
+    hob = hobkin_cmd()
+    if not hob:
+        sys.exit("eaveswatch: the reviewer runs on hobkin, which isn't installed: pipx install hobkin-eaveswatch "
+                 "brings it, or pipx install hobkin")
+    old = read_json(cfg_path, None)
+    store = a.store or (f"s3://{a.bucket.replace('s3://', '').strip('/')}/eaveswatch" if a.bucket else None)
+    if not store and old and not a.force:              # run again: the same setup (the services, the reviewer)
+        print(f"using {cfg_path} (store {old.get('store')})")
+    else:
+        if not store:
+            region = imds_region() or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+            seen = list_buckets(region)
+            if not sys.stdin.isatty():
+                sys.exit("eaveswatch: which S3 bucket? --bucket NAME" + (f" (these credentials see: {', '.join(seen[:10])})" if seen else ""))
+            if seen:
+                print("buckets these credentials can see:\n" + "\n".join(f"  {b}" for b in seen[:30]))
+            b = input("S3 bucket for the archive (files go under eaveswatch/ in it): ").strip().replace("s3://", "").strip("/")
+            if not b:
+                sys.exit("eaveswatch: a bucket is needed (or --store FOLDER to try it without S3)")
+            store = f"s3://{b}" + ("" if "/" in b else "/eaveswatch")
+        region = (bucket_region(urllib.parse.urlsplit(store).netloc) or imds_region() or os.environ.get("AWS_REGION")
+                  or "us-east-1") if store.startswith("s3://") else None
+        user = {"role": "finial", "env": a.env, "store": store, "state_dir": SETUP_STATE,
+                **({"region": region} if region else {}), **({"host": a.host} if a.host else {})}
+        if old and old != user and not a.force:
+            sys.exit(f"eaveswatch: {cfg_path} already sets up {old.get('store')}; --force replaces it")
+        write_json(cfg_path, user)
+        print(f"wrote {cfg_path}: finial, store {store}" + (f" ({region})" if region else ""))
+    cfg = load_config(cfg_path)
+    os.makedirs(cfg["ridge"]["data"], exist_ok=True)       # the reviewer's write folder must exist before it starts
+    text, problems = run_check(cfg, cfg_path)
+    if problems:
+        print(text)
+        sys.exit("eaveswatch: fix what check says, then run this again")
+    print("check: all good (store, credentials, clock)")
+    cmd = eaveswatch_cmd()
+    if a.no_service:
+        print(f"not installing services: run `{cmd} --config {cfg_path} finial` yourself")
+    else:
+        unit_dir = os.path.expanduser("~/.config/systemd/user")
+        unit = os.path.join(unit_dir, "eaveswatch-finial.service")
+        want = FINIAL_UNIT.format(cmd=cmd, config=cfg_path)
+        if os.path.exists(unit) and _read(unit) != want and not a.force:
+            print(f"leaving {unit} as it is (it differs; --force replaces it)")
+        else:
+            os.makedirs(unit_dir, exist_ok=True)
+            with open(unit, "w") as f:
+                f.write(want)
+        for c in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", "eaveswatch-finial"]):
+            r = subprocess.run(c, capture_output=True, text=True)
+            if r.returncode:
+                sys.exit(f"eaveswatch: {' '.join(c)} failed: {r.stderr.strip()} (no user systemd here? try --no-service)")
+        print("started eaveswatch-finial (a user service: systemctl --user status eaveswatch-finial)")
+    d = install_chore(None, True)
+    print(f"the reviewer chore: {d}")
+    args = hob + [a.url, a.model] + ([a.key] if a.key else []) + [
+        "--chore", "eaveswatch", "--set", f"config={cfg_path}", "--set", f"data={cfg['ridge']['data']}",
+        "--set", f"command={cmd}", "--id", "eaveswatch", "--safe"] + (["--no-service"] if a.no_service else []) + \
+        ([] if a.no_chat else ["--chat"])
+    print("starting the reviewer (hobkin): it looks at this box, then asks you what you care about")
+    sys.stdout.flush()
+    os.execvp(args[0], args)
+
+
 # ---- command line
 def loop(cfg: dict, once: bool, *steps) -> None:
     while True:
@@ -2405,6 +2561,9 @@ def cli(argv: list[str] | None = None) -> None:
     k = sub.add_parser("key")
     k.add_argument("kind", choices=KINDS)
     k.add_argument("host", nargs="?")
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and (re.match(r"https?://", argv[0]) or argv[0] == "setup"):    # eaveswatch URL MODEL [KEY]: the one-line setup
+        return setup(argv[1:] if argv[0] == "setup" else argv)
     args = ap.parse_args(argv)
     if args.cmd == "chore":                   # needs no config
         try:
