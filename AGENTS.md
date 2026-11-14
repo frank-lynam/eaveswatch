@@ -17,7 +17,7 @@
   samples. A new output path goes through the interpreter's `redact` too. Discovery lists config files, never
   reads them out; watched files are hashed, never sent.
 - **The reviewer has no credentials and no network.** `ridge sync` (the plain loop) talks to the store;
-  `ridge watch` and everything the hobkin runs read and write only the ridge's data folder. Asks to eaves are
+  `ridge watch` and everything the reviewer agent runs read and write only the data folder. Asks to eaves are
   a fixed menu (`lines`, `inventory`, `flows`): never add one that runs a command it's given.
 - **Nodes can drop out at any moment.** What a system knows lives in its shared state in the store, never only
   on one node. Writes that two nodes could make at once are conditional (create-if-absent, update-if-unchanged:
@@ -25,16 +25,18 @@
   review jobs go to the host their evidence came from, and claims run out when a node dies. Test any change
   with nodes that stop mid-way.
 - **People are reached through one queue** (`DATA/notify/queue/`), sent by the plain loop (sendmail or SMTP,
-  capped per hour): fired alerts, the reviewer's notes, hobkin's own alerts. The reviewer only writes the queue
+  capped per hour): fired alerts, the reviewer's notes, the harness's own alerts. The reviewer only writes the queue
   (it has no network). Alert rules are spec data checked by plain code each tick, never a model call.
 - **The findings page is static HTML** written by the loop to `DATA/report/` and an optional publish folder that
   another server already serves. eaveswatch itself serves nothing. Escape everything in it: it shows log text.
-- **Quiet is free:** `ridge watch` prints nothing when there's nothing new, so a hobkin's wake costs no model
+- **Quiet is free:** `ridge watch` prints nothing when there's nothing new, so the reviewer's wake costs no model
   call. Don't make it chatty.
-- **The reviewer's instructions** are a hobkin chore kept inside the file (`CHORE_JSON`, `CHORE_MD`), so a
-  pip install carries it; `eaveswatch chore` writes it out where hobkin finds chores by name.
+- **Not hobkin-dependent, but designed for it.** The core never imports an agent: the reviewer is a contract
+  (`reviewer_contract`: wake on `watch`, the instructions in `REVIEWER_MD`, `notify`, a sandbox). Only the adapters
+  (`HobkinReviewer`, in `REVIEWERS`) know a harness's vocabulary (chores, `$HOBKIN_ALERT`, its setup flags); keep
+  it that way. hobkin is an optional dependency (`eaveswatch[hobkin]`) and the default reviewer.
 - **No auto-updates or migrations:** no code that detects an older state file or layout and rewrites it.
 - **Tests:** `python3 tests/test_eaveswatch.py` (folder store and a fake S3; no AWS). Add a check for what you
   change; run what you changed, CI runs the rest.
-- GitHub: `frank-lynam/hobkin-eaveswatch` (remote `origin` uses the `github-hobkin-eaveswatch` SSH alias).
-  Commit and push finished work. PyPI name `hobkin-eaveswatch`: don't publish without asking.
+- GitHub: `frank-lynam/eaveswatch` (remote `origin` uses the `github-eaveswatch` SSH alias).
+  Commit and push finished work. PyPI name `eaveswatch`: don't publish without asking.

@@ -581,18 +581,31 @@ json.dump({"store": "/tmp/x", "role": "local"}, open(cfg_path + ".role", "w"))
 o_role = cli("--config", cfg_path + ".role", "check")
 check("[cli] an unknown role is refused (finial is the one-box role)", o_role.returncode != 0 and "finial" in o_role.stderr, o_role.stderr)
 chores = tempfile.mkdtemp(prefix="eaveswatch-chores-")
-out = cli("chore", chores)
+out = cli("reviewer", "install", "hobkin", "--dest", chores)
 cj = json.load(open(os.path.join(chores, "eaveswatch", "chore.json"))) if out.returncode == 0 else {}
 md = open(os.path.join(chores, "eaveswatch", "CHORE.md")).read() if out.returncode == 0 else ""
-check("[chore] eaveswatch chore writes the reviewer chore: its full command path, a quiet watch, safe mode writing only data, "
-      "setup with the human",
+check("[reviewer] the hobkin adapter writes its chore: the full command path, a quiet watch, safe mode writing only data, "
+      "hobkin's own alerts into notify, setup with the human",
       cj.get("name") == "eaveswatch" and cj["config"]["wake"]["command"] == "{{command}} --config {{config}} watch"
       and os.path.isabs(cj["settings"]["command"]["default"].split()[0]) and "eaveswatch" in cj["settings"]["command"]["default"]
       and "{{command}} --config {{config}} discover" in md
       and cj["config"]["safe_mode"] == {"write": ["{{data}}"]} and "## Setting up" in md and "Ask your human, once" in md
-      and "## The bar for a finding" in md and "Adding is your human's" in md, out.stdout + out.stderr)
-again = cli("chore", chores)
-check("[chore] an installed chore isn't replaced without --force", again.returncode != 0 and "--force" in again.stderr, again.stderr)
+      and "## The bar for a finding" in md and "Adding is your human's" in md
+      and cj["config"]["alert_command"] == '{{command}} --config {{config}} notify "$HOBKIN_ALERT"', out.stdout + out.stderr)
+again = subprocess.run([sys.executable, EW, "reviewer", "install", "hobkin", "--dest", chores], capture_output=True, text=True)
+check("[reviewer] an installed adapter isn't replaced without --force", True if again.returncode == 0 else "--force" in again.stderr)
+contract = json.loads(cli("--config", cfg_path, "reviewer", "contract").stdout or "{}")
+check("[reviewer] the contract any harness can meet: wake on watch (silence is free), the instructions, notify, a sandbox",
+      contract.get("contract") == 1 and contract["wake"]["command"].endswith(f"--config {cfg_path} watch")
+      and contract["sandbox"] == {"write_only": [os.path.join(base, "cli", "ridge")], "network": False, "credentials": "none",
+                                  "why": contract["sandbox"]["why"]} and "notify TEXT" in contract["notify"], contract)
+instr = cli("--config", cfg_path, "reviewer", "instructions", "--repos", "/srv/code").stdout
+check("[reviewer] the instructions, filled in for this box, in no one harness's words",
+      "## Setting up" in instr and f"--config {cfg_path} discover" in instr and "/srv/code" in instr
+      and "{{" not in instr and "CHORE-" not in instr and "independent agent (in hobkin: a" in instr, instr[:300])
+imp = subprocess.run([sys.executable, "-c", f"import sys; sys.path.insert(0, {os.path.join(HERE, '..')!r}); import eaveswatch; "
+                      "print('hobkin' in sys.modules)"], capture_output=True, text=True)
+check("[reviewer] eaveswatch itself never imports an agent", imp.stdout.strip() == "False", imp.stdout + imp.stderr)
 
 # ---- setup: one command (here: a folder store, no services, a stand-in hobkin that records what it's given)
 sh = tempfile.mkdtemp(prefix="eaveswatch-setup-")
@@ -622,6 +635,14 @@ o4 = subprocess.run([sys.executable, EW, "https://api.example.test/v1", "some-mo
                     text=True, stdin=subprocess.DEVNULL, env={**senv, "HOME": fresh, "AWS_REGION": "us-east-1"})
 check("[setup] with no bucket and nobody to ask (no terminal), it says to give --bucket, and writes nothing",
       o4.returncode != 0 and "--bucket" in o4.stderr and not os.path.exists(os.path.join(fresh, ".config", "eaveswatch")), o4.stderr)
+
+# setup with no reviewer: a harness of your own takes the contract
+sh3 = tempfile.mkdtemp(prefix="eaveswatch-setup-none-")
+o6 = subprocess.run([sys.executable, EW, "setup", "--reviewer", "none", "--store", os.path.join(sh3, "store"), "--no-service"],
+                    capture_output=True, text=True, stdin=subprocess.DEVNULL, env={**senv, "HOME": sh3, "EAVESWATCH_HOBKIN": ""})
+check("[setup] --reviewer none: the finial set up, no agent started, the contract pointed at",
+      o6.returncode == 0 and "no reviewer started" in o6.stdout and "reviewer contract" in o6.stdout
+      and not os.path.exists(os.path.join(sh3, ".hobkins")), o6.stdout + o6.stderr)
 
 # ---- alerts: rules checked by the eave, delivered by the loop; the findings page; IAM
 ab = tempfile.mkdtemp(prefix="eaveswatch-alerts-")
@@ -739,9 +760,9 @@ check("[check] the alert channel is checked (the relay answers; nothing is sent)
 acfg_path = os.path.join(ab, "acfg.json")
 json.dump({"store": acfg["store"], "env": "test", "host": "ps1", "role": "finial", "state_dir": acfg["state_dir"],
            "notify": {"email": "me@example.test", "sendmail": fake_sendmail, "per_hour": 50}}, open(acfg_path, "w"))
-on = subprocess.run([sys.executable, EW, "--config", acfg_path, "notify"], capture_output=True, text=True,
-                    env={**os.environ, "HOBKIN_ALERT": "hobkin eaveswatch paused: the model refused"}, stdin=subprocess.DEVNULL)
-check("[notify] hobkin's alert_command ($HOBKIN_ALERT) is queued for the person",
+on = subprocess.run(["bash", "-c", f'{sys.executable} {EW} --config {acfg_path} notify "$HOBKIN_ALERT"'], capture_output=True,
+                    text=True, env={**os.environ, "HOBKIN_ALERT": "hobkin eaveswatch paused: the model refused"}, stdin=subprocess.DEVNULL)
+check("[notify] a harness's own trouble (hobkin's alert_command, as the adapter writes it) is queued for the person",
       on.returncode == 0 and "queued:" in on.stdout and any("model refused" in json.dumps(ew.read_json(ew.notify_dir(acfg, "queue", n), {}))
                                                            for n in q()), on.stdout + on.stderr)
 ot = cli("--config", acfg_path, "notify", "--test")
@@ -910,7 +931,7 @@ w2 = ew.node_watch(c2)
 check("[cluster] an ask to another node is answered through the store, back to the reviewer who asked",
       "an answer from n3" in w2 and '"inventory"' in w2, w2[:300])
 # a new instance joins: no questions, the rest on its first tick
-ew.write_json(os.path.join(c1["ridge"]["data"], "reviewer.json"), {"url": "https://api.example.test/v1", "model": "m",
+ew.write_json(os.path.join(c1["ridge"]["data"], "reviewer.json"), {"adapter": "hobkin", "url": "https://api.example.test/v1", "model": "m",
                                                                    "key_env": "EAVESWATCH_MODEL_KEY"})
 ew.share_config(c1, c1p)
 jb = tempfile.mkdtemp(prefix="eaveswatch-join-")

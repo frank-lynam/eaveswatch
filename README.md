@@ -1,7 +1,9 @@
-# hobkin-eaveswatch
+# eaveswatch
 
-Logs, deploys, config and connections, joined to the code that made them, for a
-[hobkin](https://github.com/frank-lynam/hobkin) to set up and review.
+Logs, deploys, config and connections, joined to the code that made them, for an
+AI agent to set up and review. It's designed for
+[hobkin](https://github.com/frank-lynam/hobkin), and works with any agent harness
+that meets its [reviewer contract](#the-reviewer-contract).
 
 Scanners look at one thing at a time: a diff, a dependency, a log line. The
 interesting problems are joins: *since Tuesday's config change that error is
@@ -10,7 +12,7 @@ what's needed to see those and hands it to a reviewer agent. The agent works
 out what's worth collecting and how to read it. It gets a bar for what counts as
 a finding, and a ledger that traces every conclusion back to its evidence.
 
-- **No hand-written log config.** The reviewer hobkin runs `discover`:
+- **No hand-written log config.** The reviewer agent runs `discover`:
   - which services run here, and what they run
   - which files each one has open for writing
   - which ports they listen on and talk to
@@ -48,7 +50,7 @@ As **the same user the watched services run as** (with those services as user
 systemd units), run:
 
 ```sh
-pipx install hobkin-eaveswatch          # brings hobkin too
+pipx install 'eaveswatch[hobkin]'       # with hobkin, the reviewer it's designed for
 eaveswatch https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-...    # the reviewer's model API
 ```
 
@@ -75,8 +77,10 @@ Everything else is decided for you:
 
 It runs `check`, installs and starts the `eaveswatch-finial` user service,
 turns on lingering (so the services run with nobody logged in), installs the
-reviewer chore, and hands over to hobkin. You end up in a chat with the
-reviewer. Run it again later and it reuses the same setup.
+reviewer's instructions as a hobkin chore, and hands over to hobkin. You end up
+in a chat with the reviewer. Run it again later and it reuses the same setup.
+`--reviewer none` sets everything up without starting an agent, for a harness
+of your own.
 
 Options:
 - `--bucket NAME`, `--alert-email ADDR` (with `--smtp host:port` for a relay),
@@ -167,8 +171,9 @@ It writes this instance's config (its own host), and on its first tick pulls
 the interpreter, alert rules, charter and findings. It runs `check`, starts the
 user service, and starts the reviewer with its key from `$EAVESWATCH_MODEL_KEY`
 (or the variable the system names) and no chat. `--no-reviewer` makes a
-collector-only node, which shares data but never leads or reviews. hobkin keeps
-the key it's given in its own key file, readable only by that user. AWS
+collector-only node, which shares data but never leads or reviews. The hobkin
+adapter keeps the key it's given in hobkin's own key file, readable only by
+that user. AWS
 credentials come from the instance profile.
 
 `cluster` in the config tunes the timings: `lease_seconds` (180),
@@ -268,16 +273,40 @@ PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=ps-hr-01/ps-hr-01_202611
 
 Every host runs an eave ([examples/fleet/](examples/fleet/)): plumbing-only
 config, with its interpreter in `STATE_DIR/interpreter`. The hub runs the ridge
-sync loop with the store's credentials, and the reviewer hobkin has none:
+sync loop with the store's credentials, and the reviewer agent has none:
 `ridge watch` and every command it runs read and write only the ridge's data
 folder. IAM: [examples/iam/eave.json](examples/iam/eave.json) and
 [examples/iam/ridge.json](examples/iam/ridge.json). The ridge never gets
 `kind=raw`.
 
+## The reviewer contract
+
+eaveswatch never imports an agent. It talks to its reviewer through commands and
+files, so any harness that does these four things can be the reviewer:
+
+1. **Wake on `eaveswatch watch`** about once a minute, and act only when it
+   prints something. Silence means there's nothing to do, so it costs nothing.
+2. **Follow the instructions** printed by `eaveswatch reviewer instructions`,
+   filled in for this box.
+3. **Reach a person through `eaveswatch notify TEXT`**, for its own notes and for
+   the harness's own trouble (its model refusing, say).
+4. **Run sandboxed:** write only the data folder, no network, no credentials.
+   The reviewer reads logs, commit messages and requests that attackers can
+   write. eaveswatch keeps its own side safe (redaction before anything leaves
+   a host, nothing that needs credentials, asks to other hosts from a fixed
+   menu), but the sandbox is the harness's job.
+
+`eaveswatch reviewer contract` prints all of that as JSON, for this box.
+**hobkin** is built in as the adapter (`pip install 'eaveswatch[hobkin]'`).
+`eaveswatch reviewer install hobkin` writes the instructions as a hobkin chore:
+its wake, safe mode writing only the data folder, and its alert command into
+`notify`. Setup and `join` start it. Another harness gets an adapter class
+beside `HobkinReviewer` (in `REVIEWERS`), or just uses the contract.
+
 ## What the reviewer does
 
-The chore's instructions (`CHORE_MD` in `eaveswatch.py`; `eaveswatch chore`
-writes them out) cover setting up, keeping the interpreter right, and
+The instructions (`REVIEWER_MD` in `eaveswatch.py`; `eaveswatch reviewer
+instructions` prints them) cover setting up, keeping the interpreter right, and
 reviewing:
 
 - **The map** (`DATA/map/`): hosts (what runs, versions, watched hashes), edges

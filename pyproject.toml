@@ -3,16 +3,17 @@ requires = ["flit_core>=3.12,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "hobkin-eaveswatch"
-description = "Logs, deploys and connections from every host, joined to the code that made them, for a hobkin to review. One stdlib-only Python file; S3 or a folder in between."
+name = "eaveswatch"
+description = "AI log review that sets itself up: eaves on every host turn logs into templates and alerts, an agent (designed for hobkin, or any harness that meets its contract) reviews what changed against the code. One stdlib-only Python file; S3 or a folder in between."
 dynamic = ["version"]   # from eaveswatch.__version__
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Frank Lynam" }]
 requires-python = ">=3.9"
-dependencies = ["hobkin>=0.5.6"]   # the reviewer runs on hobkin (eaveswatch.py itself is stdlib only)
-keywords = ["security", "logs", "review", "agent", "llm", "hobkin", "s3", "observability"]
+dependencies = []
+
+keywords = ["security", "logs", "review", "agent", "llm", "ai", "alerts", "s3", "observability", "hobkin"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Environment :: Console",
@@ -27,9 +28,12 @@ classifiers = [
     "Topic :: System :: Logging",
 ]
 
+[project.optional-dependencies]
+hobkin = ["hobkin>=0.5.6"]   # the reviewer harness eaveswatch is designed for
+
 [project.urls]
-Homepage = "https://github.com/frank-lynam/hobkin-eaveswatch"
-Issues = "https://github.com/frank-lynam/hobkin-eaveswatch/issues"
+Homepage = "https://github.com/frank-lynam/eaveswatch"
+Issues = "https://github.com/frank-lynam/eaveswatch/issues"
 
 [project.scripts]
 eaveswatch = "eaveswatch:cli"

@@ -14,4 +14,4 @@ loginctl enable-linger "$PSUSER"                     # user units run with nobod
 uid=$(id -u "$PSUSER")
 until [ -S "/run/user/$uid/bus" ]; do sleep 1; done  # the user's systemd is up
 sudo -u "$PSUSER" -i env XDG_RUNTIME_DIR="/run/user/$uid" EAVESWATCH_MODEL_KEY="$KEY" \
-  bash -lc "pipx install hobkin-eaveswatch && eaveswatch join $STORE $SYSTEM"
+  bash -lc "pipx install 'eaveswatch[hobkin]' && eaveswatch join $STORE $SYSTEM"

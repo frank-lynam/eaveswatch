@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""eaveswatch: logs, inventory and connections from every host, interpreted by a hobkin and reviewed by one.
+"""eaveswatch: logs, inventory and connections from every host, interpreted and reviewed by an AI agent (designed
+for hobkin; any harness that meets `eaveswatch reviewer contract` can be the reviewer).
 
     eaveswatch URL MODEL [KEY]        set this box up as a finial and start its reviewer, in one go (asks for a bucket)
     eaveswatch join STORE SYSTEM      a new instance (an ASG's) joins its system: no questions, secrets from env
@@ -9,9 +10,9 @@
                                       all spooled, then sent to the store; answers the ridge's asks
     eaveswatch ridge  [sync] [--once] the hub's loop (no model): new files from the store -> the data folder
     eaveswatch finial [--once]        one box, all of it: eave, ridge and reviewer together (files to S3 too)
-    eaveswatch ridge watch            for a hobkin's wake: the digest of what's new, or nothing
+    eaveswatch ridge watch            a standalone ridge's digest of what's new, or nothing
     eaveswatch discover [--json]      what runs here: services, processes, the logs they write, ports, configs
-    eaveswatch interpret init|test|apply|rollback|show    the interpreter spec: written by the hobkin, run by the eave
+    eaveswatch interpret init|test|apply|rollback|show    the interpreter spec: written by the reviewer, run by the eave
     eaveswatch ask HOST lines FINGERPRINT [--source NAME] [--limit N]    ask an eave for matching log lines
     eaveswatch ask HOST inventory|flows                                   ...or a fresh inventory or flows
     eaveswatch finding add < finding.json       record a finding (seen again: the same one, counted)
@@ -20,10 +21,11 @@
     eaveswatch notify TEXT [--severity page]    a note for the person (queued; the loop sends it): --test sends one now
     eaveswatch iam                              the least S3 access this role needs, as an IAM policy
     eaveswatch check                            is this set up right? store, credentials, clock, interpreter, sources
-    eaveswatch chore [DIR] [--force]            write the reviewer chore where hobkin finds it (~/.hobkins/_shared/chores)
+    eaveswatch reviewer contract|instructions   what an agent harness needs to be the reviewer
+    eaveswatch reviewer install hobkin          the hobkin adapter: its chore, where hobkin finds chores by name
     eaveswatch key KIND [HOST]                  where a file of KIND from HOST would go now (to check a layout)
 
-What to collect and how to read it is the interpreter spec: JSON written by the reviewer hobkin from what
+What to collect and how to read it is the interpreter spec: JSON written by the reviewer agent from what
 `discover` finds and what its human wants, checked by `interpret test`, applied as a numbered version. Plain code
 runs it on every line: no model per line, and no code from the model, only patterns. Redaction of secrets is
 built in and always runs first; a spec can add patterns, never remove them.
@@ -46,14 +48,14 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   ridge        sync (store -> data folder, asks -> store), the map, the digest (watch)
 #   findings     the ledger: add, seen again, status, list
 #   notify       the queue for people (alerts, the reviewer's notes), sendmail/SMTP delivery; the findings page; IAM
-#   the reviewer the hobkin chore (chore.json, CHORE.md), written out by `eaveswatch chore`
+#   the reviewer the contract and instructions for any agent harness; the hobkin adapter (its chore, its setup)
 #   check        `eaveswatch check`: each role's permissions, the interpreter, sources, versions, clock, a preview
 #   setup        `eaveswatch URL MODEL [KEY]`: a finial in one command, then hobkin's own setup with the chore
 #   cluster      a system's nodes: shared state in the store, the ridge lease, review jobs, join, the node's watch
 #   command line
 from __future__ import annotations
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 import argparse
 import configparser
@@ -516,7 +518,7 @@ SOURCE_TYPES = {"name": str, "path": str, "journald": dict, "service": (str, typ
                 "from_start": bool, "placeholders": list, "about": str}
 # Never collected, whatever a spec says: credentials and the agent's own home (a prompt-injected reviewer can't
 # point the eave at them). Matched against the real path, after symlinks.
-DENY_PATHS = ["~/.ssh/*", "~/.aws/*", "~/.gnupg/*", "~/.config/*", "~/.hobkins/*", "~/.local/share/keyrings/*",
+DENY_PATHS = ["~/.ssh/*", "~/.aws/*", "~/.gnupg/*", "~/.config/*", "~/.hobkins/*", "~/.claude/*", "~/.local/share/keyrings/*",
               "~/.netrc", "~/.pgpass", "~/.docker/*", "~/.kube/*", "/etc/shadow*", "/etc/gshadow*", "/etc/sudoers*",
               "/etc/ssl/private/*", "/proc/*", "/sys/*", "/dev/*"]
 DENY_NAMES = re.compile(r"(?i)(\.pem|\.key|\.p12|\.pfx|\.jks|\.keystore|id_rsa|id_ed25519|id_ecdsa|credentials|secret|"
@@ -1865,7 +1867,7 @@ def parse_ss(text: str, host: str) -> dict:
 # ---- ridge
 class Ridge:
     """The hub. `sync` (the plain loop, with the store's credentials) pulls new files into the data folder and
-    sends asks; `watch` (for the hobkin: no network, no credentials) reads only the data folder."""
+    sends asks; `watch` (for the reviewer: no network, no credentials) reads only the data folder."""
 
     def __init__(self, cfg: dict, store=None):
         self.cfg, self.data = cfg, cfg["ridge"]["data"]
@@ -2431,33 +2433,10 @@ def iam_policy(cfg: dict) -> dict:
     return {"Version": "2012-10-17", "Statement": stmts}
 
 
-# ---- the reviewer: a hobkin chore, written out by `eaveswatch chore` (it travels inside this one file)
-CHORE_JSON = {
-    "name": "eaveswatch",
-    "description": "Watch a system from its eaves: work out what runs and what it logs, set up the interpreter with "
-                   "your human, then review logs, deploys, config and connections against the code that made them. "
-                   "Targeted findings, each traceable to its evidence.",
-    "settings": {
-        "config": {"about": "the eaveswatch config file (its ridge data folder holds the interpreter, discovery, "
-                            "digests, the map and the findings)"},
-        "data": {"about": "the ridge's data folder (\"ridge\": {\"data\"} in that config, by default STATE_DIR/ridge): "
-                          "the agent may write here and nowhere else"},
-        "command": {"default": "eaveswatch",
-                    "about": "how to run eaveswatch (written as its full path by `eaveswatch chore`: a service's PATH is short)"},
-        "repos": {"default": "none given",
-                  "about": "where code lives on this box (git checkouts, exported projects), to read the code behind a log line"},
-    },
-    "given": "You're now the eaveswatch reviewer here. Read CHORE-eaveswatch.md. If `{{command}} --config {{config}} "
-             "interpret show` says nothing's applied yet, start with \"Setting up\" there: discover, then ask your human.",
-    "config": {
-        "idle_prompt": None,
-        "safe_mode": {"write": ["{{data}}"]},
-        "wake": {"command": "{{command}} --config {{config}} watch", "every": "1m"},   # silent unless a review is ours
-        "alert_command": "{{command}} --config {{config}} notify",     # notify, and hobkin's own alerts: the person's queue
-    },
-}
-
-CHORE_MD = """# Watch this system from its eaves
+# ---- the reviewer: what any agent harness needs to be eaveswatch's reviewer (the contract, the instructions), and
+# the adapter for hobkin, the harness eaveswatch is designed for (`pip install eaveswatch[hobkin]`). The core never
+# imports an agent: it speaks through commands and files, and only the adapters know a harness's vocabulary.
+REVIEWER_MD = """# Watch this system from its eaves
 
 An **eave** here reads the logs your **interpreter** names, turns each entry into a
 template with counts (redacted first: secrets never leave), notes versions and
@@ -2534,7 +2513,7 @@ review what's routed to you, not everything.
      (or `["*"]`), `"silent": {"source", "minutes"}` (a source that's gone quiet).
      Few and sharp: an alert nobody acts on teaches them to ignore the next one.
    Globs, not today's file names: logs that roll by date (`APPSRV_1114.LOG`) need
-   `APPSRV_*.LOG`. Credential files and folders (`~/.ssh`, keys, `~/.hobkins`...)
+   `APPSRV_*.LOG`. Credential files and folders (`~/.ssh`, keys, an agent's own home...)
    are refused, whatever you write.
 4. **Test until it reads well.** `{{command}} --config {{config}} interpret test FILE`
    replays the real recent lines of every source through it. Aim for: every source
@@ -2597,8 +2576,9 @@ All of these, or it isn't one:
 - **confidence**: high / medium / low, and why.
 
 Without all four it's an **observation**: a line in your NOTES.md. **Before
-recording, try to knock it down**: give a brownie the claim and the evidence and
-ask why it's wrong. Only what survives goes in. **At most three findings a
+recording, try to knock it down**: give a second, independent agent (in hobkin: a
+brownie) the claim and the evidence and ask why it's wrong; if your harness has
+none, argue the other side yourself, in writing, before you decide. Only what survives goes in. **At most three findings a
 digest.**
 
 ```sh
@@ -2639,22 +2619,102 @@ def eaveswatch_cmd() -> str:
     return shutil.which("eaveswatch") or f"{sys.executable} {os.path.abspath(__file__)}"
 
 
-def install_chore(dest: str | None, force: bool) -> str:
-    """Write the reviewer chore (chore.json, CHORE.md) into DEST/eaveswatch; default: where hobkin looks for
-    chores by name (~/.hobkins/_shared/chores, or $HOBKIN_HOME's). An existing one is kept unless `force`."""
-    root = os.path.expanduser(dest or os.path.join(os.environ.get("HOBKIN_HOME") or "~/.hobkins", "_shared", "chores"))
-    d = os.path.join(root, "eaveswatch")
-    if os.path.exists(os.path.join(d, "chore.json")) and not force:
-        raise ValueError(f"{d} already has the chore (--force replaces it)")
-    os.makedirs(d, exist_ok=True)
-    chore = json.loads(json.dumps(CHORE_JSON))
-    chore["settings"]["command"]["default"] = eaveswatch_cmd()   # its full path: a service's PATH is short
-    with open(os.path.join(d, "chore.json"), "w") as f:
-        json.dump(chore, f, indent=2)
-        f.write("\n")
-    with open(os.path.join(d, "CHORE.md"), "w") as f:
-        f.write(CHORE_MD)
-    return d
+def reviewer_instructions(cfg: dict, cfg_path: str, command: str | None = None, repos: str | None = None) -> str:
+    """The reviewer's instructions, filled in for this box (any harness)."""
+    vals = {"command": command or eaveswatch_cmd(), "config": cfg_path, "data": cfg["ridge"]["data"],
+            "repos": repos or "none given"}
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: vals.get(m.group(1), m.group(0)), REVIEWER_MD)
+
+
+def reviewer_contract(cfg: dict, cfg_path: str) -> dict:
+    """What a harness must do to be the reviewer: wake on `watch`, follow the instructions, reach a person through
+    `notify`, and run sandboxed (it reads text attackers write). Stable: adapters and other harnesses build on it."""
+    cmd = f"{eaveswatch_cmd()} --config {cfg_path}"
+    return {"contract": 1, "wake": {"command": f"{cmd} watch", "every_seconds": 60,
+                                    "rule": "act only when it prints something: silence means nothing to do, and costs nothing"},
+            "instructions": f"{cmd} reviewer instructions",
+            "notify": f"{cmd} notify TEXT", "commands": f"{cmd} --help",
+            "sandbox": {"write_only": [cfg["ridge"]["data"]], "network": False, "credentials": "none",
+                        "why": "the reviewer reads logs, commit messages and requests that attackers can write"},
+            "harness_alerts": f"{cmd} notify TEXT (the harness's own trouble, e.g. its model refusing, reaches the same person)"}
+
+
+class HobkinReviewer:
+    """The reviewer as a hobkin agent: the instructions as a hobkin chore (its wake, safe mode writing only the data
+    folder, its alert command into notify), started with hobkin's own one-line setup."""
+    name = "hobkin"
+
+    @staticmethod
+    def command() -> list[str] | None:
+        """How to run hobkin: $EAVESWATCH_HOBKIN (tests), the hobkin installed beside us, or one on PATH."""
+        if os.environ.get("EAVESWATCH_HOBKIN"):
+            return os.environ["EAVESWATCH_HOBKIN"].split()
+        try:
+            import hobkin                          # installed with eaveswatch[hobkin]: run its file with this Python
+            return [sys.executable, os.path.abspath(hobkin.__file__)]
+        except ImportError:
+            found = shutil.which("hobkin")
+            return [found] if found else None
+
+    @staticmethod
+    def chore() -> tuple[dict, str]:
+        spec = {
+            "name": "eaveswatch",
+            "description": "Watch a system from its eaves: work out what runs and what it logs, set up the interpreter "
+                           "with your human, then review logs, deploys, config and connections against the code that "
+                           "made them. Targeted findings, each traceable to its evidence.",
+            "settings": {
+                "config": {"about": "the eaveswatch config file"},
+                "data": {"about": "the eaveswatch data folder: the agent may write here and nowhere else"},
+                "command": {"default": eaveswatch_cmd(),
+                            "about": "how to run eaveswatch (its full path: a service's PATH is short)"},
+                "repos": {"default": "none given",
+                          "about": "where code lives on this box (checkouts, exported projects), to read the code behind a log line"},
+            },
+            "given": "You're now the eaveswatch reviewer here. Read CHORE-eaveswatch.md. If `{{command}} --config {{config}} "
+                     "interpret show` says nothing's applied yet, start with \"Setting up\" there: discover, then ask your human.",
+            "config": {
+                "idle_prompt": None,
+                "safe_mode": {"write": ["{{data}}"]},
+                "wake": {"command": "{{command}} --config {{config}} watch", "every": "1m"},   # silent unless there's work
+                "alert_command": "{{command}} --config {{config}} notify \"$HOBKIN_ALERT\"",  # hobkin's own trouble too
+            },
+        }
+        return spec, REVIEWER_MD
+
+    def install(self, dest: str | None = None, force: bool = True) -> str:
+        """Write the chore where hobkin finds chores by name (~/.hobkins/_shared/chores, or $HOBKIN_HOME's)."""
+        root = os.path.expanduser(dest or os.path.join(os.environ.get("HOBKIN_HOME") or "~/.hobkins", "_shared", "chores"))
+        d = os.path.join(root, "eaveswatch")
+        if os.path.exists(os.path.join(d, "chore.json")) and not force:
+            raise ValueError(f"{d} already has the chore (--force replaces it)")
+        os.makedirs(d, exist_ok=True)
+        spec, md = self.chore()
+        with open(os.path.join(d, "chore.json"), "w") as f:
+            json.dump(spec, f, indent=2)
+            f.write("\n")
+        with open(os.path.join(d, "CHORE.md"), "w") as f:
+            f.write(md)
+        return d
+
+    def start(self, cfg: dict, cfg_path: str, url: str, model: str, key: str | None, no_service: bool, chat: bool,
+              say: str) -> None:
+        """The chore, then hobkin's own one-line setup with it (this process becomes hobkin)."""
+        hob = self.command()
+        if not hob:
+            sys.exit("eaveswatch: the hobkin reviewer needs hobkin: pip install 'eaveswatch[hobkin]' (or pipx install hobkin), "
+                     "or set up with --reviewer none and give your own agent `eaveswatch reviewer contract`")
+        print(f"the reviewer's instructions, as a hobkin chore: {self.install()}")
+        args = hob + [url, model] + ([key] if key else []) + [
+            "--chore", "eaveswatch", "--set", f"config={cfg_path}", "--set", f"data={cfg['ridge']['data']}",
+            "--set", f"command={eaveswatch_cmd()}", "--id", "eaveswatch", "--safe"] + (["--no-service"] if no_service else []) + \
+            (["--chat"] if chat else [])
+        print(say)
+        sys.stdout.flush()
+        os.execvp(args[0], args)
+
+
+REVIEWERS = {"hobkin": HobkinReviewer()}      # the adapters: a harness that meets the contract can be added here
 
 
 # ---- check: is this host (or ridge) set up right? Each role's own permissions, the interpreter, sources, clock
@@ -2968,24 +3028,14 @@ def list_buckets(region: str, endpoint: str | None = None) -> list[str]:
         return []
 
 
-def hobkin_cmd() -> list[str] | None:
-    """How to run hobkin: $EAVESWATCH_HOBKIN (tests), the hobkin installed beside us, or one on PATH."""
-    if os.environ.get("EAVESWATCH_HOBKIN"):
-        return os.environ["EAVESWATCH_HOBKIN"].split()
-    try:
-        import hobkin                              # installed with us (a dependency): run its file with this Python
-        return [sys.executable, os.path.abspath(hobkin.__file__)]
-    except ImportError:
-        found = shutil.which("hobkin")
-        return [found] if found else None
-
-
 def setup(argv: list[str]) -> None:
     ap = argparse.ArgumentParser(prog="eaveswatch", description="Set this box up as a finial and start its reviewer: "
-                                 "eaveswatch URL MODEL [KEY] (the model API the reviewer uses, as for hobkin).")
-    ap.add_argument("url")
-    ap.add_argument("model")
+                                 "eaveswatch URL MODEL [KEY] (the model API the reviewer uses), or --reviewer none.")
+    ap.add_argument("url", nargs="?")
+    ap.add_argument("model", nargs="?")
     ap.add_argument("key", nargs="?")
+    ap.add_argument("--reviewer", default="hobkin", choices=sorted(REVIEWERS) + ["none"],
+                    help="the agent harness that reviews (default hobkin); none: bring your own, see `reviewer contract`")
     ap.add_argument("--bucket", help="the S3 bucket for the archive (asked for if not given)")
     ap.add_argument("--store", help="instead of --bucket: s3://bucket/prefix, or a folder")
     ap.add_argument("--env", default="prod")
@@ -3003,10 +3053,12 @@ def setup(argv: list[str]) -> None:
     a = ap.parse_args(argv)
     cfg_path = os.path.expanduser(SETUP_CONFIG)
     asking = sys.stdin.isatty()
-    hob = hobkin_cmd()
-    if not hob:
-        sys.exit("eaveswatch: the reviewer runs on hobkin, which isn't installed: pipx install hobkin-eaveswatch "
-                 "brings it, or pipx install hobkin")
+    if a.reviewer != "none":
+        if not (a.url and a.model):
+            sys.exit("eaveswatch: give the reviewer's model API: eaveswatch URL MODEL [KEY] (or --reviewer none)")
+        if a.reviewer == "hobkin" and not HobkinReviewer.command():
+            sys.exit("eaveswatch: the hobkin reviewer needs hobkin: pip install 'eaveswatch[hobkin]' (or pipx install hobkin), "
+                     "or --reviewer none to bring your own agent")
     old = read_json(cfg_path, None)
     store = a.store or (f"s3://{a.bucket.replace('s3://', '').strip('/')}/eaveswatch" if a.bucket else None)
     if not store and old and not a.force:              # run again: the same setup (the services, the reviewer)
@@ -3083,13 +3135,18 @@ def setup(argv: list[str]) -> None:
         print("  sent: check your inbox (and spam)" if sent else "  not sent: see the error above")
     install_finial_unit(cfg_path, a.no_service, a.force)
     # what a new instance of this system needs to start the same reviewer: never the key, only where it'll be
-    write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), {"url": a.url, "model": a.model, "key_env": a.key_env})
+    write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"),
+               {"adapter": a.reviewer, "url": a.url, "model": a.model, "key_env": a.key_env} if a.reviewer != "none"
+               else {"adapter": "none"})
     try:                                             # what the system's next node joins with
         print(f"shared the system's config: {share_config(cfg, cfg_path)} (new nodes: eaveswatch join STORE {cfg['system']})")
     except (OSError, urllib.error.URLError, ValueError) as e:
         print(f"note: couldn't share the system's config ({e}): new nodes can't join until it is (run this again)")
-    start_reviewer(hob, cfg, cfg_path, a.url, a.model, a.key, a.no_service, not a.no_chat,
-                   "starting the reviewer (hobkin): it looks at this box, then asks you what you care about")
+    if a.reviewer == "none":
+        print(f"no reviewer started. Give your agent harness the contract:\n  {eaveswatch_cmd()} --config {cfg_path} reviewer contract")
+        return
+    REVIEWERS[a.reviewer].start(cfg, cfg_path, a.url, a.model, a.key, a.no_service, not a.no_chat,
+                                f"starting the reviewer ({a.reviewer}): it looks at this box, then asks you what you care about")
 
 
 def install_finial_unit(cfg_path: str, no_service: bool, force: bool) -> None:
@@ -3117,20 +3174,6 @@ def install_finial_unit(cfg_path: str, no_service: bool, force: bool) -> None:
         print("turned on linger: the services run with nobody logged in" if r.returncode == 0 else
               f"note: couldn't turn on linger ({r.stderr.strip()}): an admin can, with `loginctl enable-linger {user}`")
     print("started eaveswatch-finial (a user service: systemctl --user status eaveswatch-finial)")
-
-
-def start_reviewer(hob: list[str], cfg: dict, cfg_path: str, url: str, model: str, key: str | None, no_service: bool,
-                   chat: bool, say: str) -> None:
-    """The chore, then hobkin's own one-line setup with it (this process becomes hobkin)."""
-    d = install_chore(None, True)
-    print(f"the reviewer chore: {d}")
-    args = hob + [url, model] + ([key] if key else []) + [
-        "--chore", "eaveswatch", "--set", f"config={cfg_path}", "--set", f"data={cfg['ridge']['data']}",
-        "--set", f"command={eaveswatch_cmd()}", "--id", "eaveswatch", "--safe"] + (["--no-service"] if no_service else []) + \
-        (["--chat"] if chat else [])
-    print(say)
-    sys.stdout.flush()
-    os.execvp(args[0], args)
 
 
 # ---- cluster: every instance of a system runs the same thing (a finial); what the system knows lives in the
@@ -3750,18 +3793,17 @@ def join(argv: list[str]) -> None:
     install_finial_unit(cfg_path, a.no_service, a.force)
     if a.no_reviewer or cfg["role"] != "finial":
         return
-    if not rv:
-        print("no reviewer in the system's config: start one with `eaveswatch URL MODEL` (it reuses this setup)")
+    adapter = (rv or {}).get("adapter", "none")
+    if adapter == "none" or adapter not in REVIEWERS:
+        print(f"no reviewer adapter in the system's config: give your agent harness the contract:\n  "
+              f"{eaveswatch_cmd()} --config {cfg_path} reviewer contract")
         return
     key = os.environ.get(rv.get("key_env") or "EAVESWATCH_MODEL_KEY")
     if not key:
         sys.exit(f"eaveswatch: the reviewer's model key isn't in ${rv.get('key_env') or 'EAVESWATCH_MODEL_KEY'}: set it "
                  "(from your secret store) and run this again with --force, or --no-reviewer")
-    hob = hobkin_cmd()
-    if not hob:
-        sys.exit("eaveswatch: the reviewer runs on hobkin, which isn't installed (pipx install hobkin-eaveswatch brings it)")
-    start_reviewer(hob, cfg, cfg_path, rv["url"], rv["model"], key, a.no_service, False,
-                   "starting the reviewer (hobkin): it reviews what the system routes to this node")
+    REVIEWERS[adapter].start(cfg, cfg_path, rv["url"], rv["model"], key, a.no_service, False,
+                             f"starting the reviewer ({adapter}): it reviews what the system routes to this node")
 
 
 # ---- command line
@@ -3824,9 +3866,12 @@ def cli(argv: list[str] | None = None) -> None:
     nt.add_argument("--subject")
     nt.add_argument("--severity", choices=("page", "warn"), default="warn")
     nt.add_argument("--test", action="store_true", help="send a test note now")
-    c = sub.add_parser("chore")
-    c.add_argument("dest", nargs="?")
-    c.add_argument("--force", action="store_true")
+    rv = sub.add_parser("reviewer", help="for agent harnesses: the contract, the instructions, or install an adapter")
+    rv.add_argument("action", choices=("contract", "instructions", "install"))
+    rv.add_argument("adapter", nargs="?", choices=sorted(REVIEWERS))
+    rv.add_argument("--dest")
+    rv.add_argument("--repos")
+    rv.add_argument("--force", action="store_true")
     k = sub.add_parser("key")
     k.add_argument("kind", choices=KINDS)
     k.add_argument("host", nargs="?")
@@ -3836,12 +3881,14 @@ def cli(argv: list[str] | None = None) -> None:
     if argv and argv[0] == "join":                     # a new instance joins its system (an ASG's user-data)
         return join(argv[1:])
     args = ap.parse_args(argv)
-    if args.cmd == "chore":                   # needs no config
+    if args.cmd == "reviewer" and args.action == "install":     # needs no config
+        if not args.adapter:
+            sys.exit(f"eaveswatch: reviewer install ADAPTER ({', '.join(sorted(REVIEWERS))})")
         try:
-            d = install_chore(args.dest, args.force)
+            d = REVIEWERS[args.adapter].install(args.dest, args.force)
         except ValueError as e:
             sys.exit(f"eaveswatch: {e}")
-        print(f"wrote the reviewer chore to {d}\ngive it to a hobkin: hobkin --chore eaveswatch --set config=... --set data=... --safe")
+        print(f"wrote the {args.adapter} reviewer's instructions to {d}")
         return
     if args.cmd == "interpret" and args.action == "_replay":      # the child `interpret test` runs: no config needed
         print(json.dumps(replay(json.load(open(args.file)))))
@@ -3876,6 +3923,11 @@ def cli(argv: list[str] | None = None) -> None:
             open(os.path.join(data, "jobs", "release", args.id), "w").close()
             print(f"job {args.id}: given back (another node will take it)")
         return
+    if args.cmd == "reviewer":
+        path = os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json")
+        print(json.dumps(reviewer_contract(cfg, path), indent=2) if args.action == "contract"
+              else reviewer_instructions(cfg, path, repos=args.repos))
+        return
     if args.cmd == "iam":
         if not cfg["store"].startswith("s3://"):
             sys.exit(f"eaveswatch: the store is a folder ({cfg['store']}): no IAM policy needed")
@@ -3889,9 +3941,9 @@ def cli(argv: list[str] | None = None) -> None:
                   "not sent: " + ("no notify channel in the config" if not (cfg.get("notify") or {}).get("email") else
                                   f"{left} waiting (see the error above)"))
             sys.exit(0 if sent else 1)
-        text = " ".join(args.text) or os.environ.get("HOBKIN_ALERT") or ("" if sys.stdin.isatty() else sys.stdin.read())
+        text = " ".join(args.text) or ("" if sys.stdin.isatty() else sys.stdin.read())
         if not text.strip():
-            sys.exit("eaveswatch: notify TEXT (or $HOBKIN_ALERT, or text on stdin)")
+            sys.exit("eaveswatch: notify TEXT (or text on stdin)")
         subject = args.subject or text.strip().splitlines()[0][:120]
         print(f"queued: {queue_note(cfg, subject, text.strip(), args.severity, 'reviewer')} (sent by the loop within a minute)")
         return
