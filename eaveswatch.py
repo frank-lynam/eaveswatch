@@ -77,7 +77,9 @@ DEFAULTS = {
     "warmup_minutes": 60,        # an eave's first hour only learns what's usual: nothing is "new" yet
     "inventory_every": 3600,     # inventory and flows are sent when they change, and at least this often
     "max_samples": 3,            # example lines kept per template per packet
-    "ridge": {"data": None, "envs": None, "silent_after": 7200},   # data default: STATE_DIR/ridge
+    "spool_max_mb": 512,         # files wait in STATE_DIR/spool until the store takes them; over this, the oldest go
+    "ridge": {"data": None, "envs": None, "silent_after": 7200,    # data default: STATE_DIR/ridge
+              "late_hours": 24, "late_every": 600},   # every late_every s, look this far back for late arrivals
 }
 KINDS = ("packets", "inventory", "flows", "raw", "requests", "answers")
 RIDGE_READS = ("packets", "inventory", "flows", "answers")     # never raw: the reviewer doesn't read the archive
@@ -432,14 +434,84 @@ class Eave:
         self.state.setdefault("baseline", {})
         self.state.setdefault("started", iso(now_utc()))
         self.redact = redactor(cfg["redact"])
+        self.last_flush = (0, 0)                     # (sent, still spooled) at the last tick
 
     def save(self) -> None:
         write_json(self.path, self.state)
 
+    # --- the spool: every file is written here first, and sent from here, so a store that's down loses nothing
+    def spool_dir(self) -> str:
+        return os.path.join(self.cfg["state_dir"], "spool")
+
     def put(self, kind: str, records: list[dict], t: dt.datetime | None = None) -> str:
+        """Spool a file for the store (it's sent by flush). Returns its key."""
         key = object_key(self.cfg["env"], kind, self.cfg["host"], t or now_utc())
-        self.store.put(key, pack(records))
+        path = os.path.join(self.spool_dir(), key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
+            f.write(pack(records))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         return key
+
+    def spooled(self) -> list[tuple[str, str, int]]:
+        """(stamp, key, bytes) of every spooled file, oldest first."""
+        root, out = self.spool_dir(), []
+        for d, _, names in os.walk(root):
+            for n in names:
+                if n.endswith(".jsonl.gz"):
+                    full = os.path.join(d, n)
+                    m = re.search(r"_(\d{8}T\d{6}Z)_", n)
+                    try:
+                        out.append((m.group(1) if m else "", os.path.relpath(full, root).replace(os.sep, "/"), os.path.getsize(full)))
+                    except OSError:
+                        pass
+        return sorted(out)
+
+    def spool_stats(self) -> dict:
+        files = self.spooled()
+        return {"files": len(files), "bytes": sum(b for _, _, b in files), "oldest": files[0][0] if files else None,
+                "dropped": self.state.get("spool_dropped", 0), "last_error": self.state.get("spool_error")}
+
+    def trim_spool(self) -> int:
+        """Over spool_max_mb (the store's been away a long time): drop the oldest raw files first, then the oldest
+        of anything, and say so in the next packet. Returns how many were dropped."""
+        files, cap = self.spooled(), self.cfg["spool_max_mb"] * 1024 * 1024
+        total, dropped = sum(b for _, _, b in files), 0
+        order = [f for f in files if "/kind=raw/" in "/" + f[1]] + [f for f in files if "/kind=raw/" not in "/" + f[1]]
+        for _, key, size in order:
+            if total <= cap:
+                break
+            try:
+                os.remove(os.path.join(self.spool_dir(), key))
+            except OSError:
+                continue
+            total -= size
+            dropped += 1
+        if dropped:
+            self.state["spool_dropped"] = self.state.get("spool_dropped", 0) + dropped
+            self.state["spool_dropped_new"] = self.state.get("spool_dropped_new", 0) + dropped
+        return dropped
+
+    def flush(self) -> tuple[int, int]:
+        """Send spooled files to the store, oldest first, each deleted once it's there. Stops at the first
+        failure (the rest wait for the next tick). Returns (sent, still spooled)."""
+        files, sent = self.spooled(), 0
+        for _, key, _ in files:
+            path = os.path.join(self.spool_dir(), key)
+            try:
+                with open(path, "rb") as f:
+                    self.store.put(key, f.read())
+            except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
+                self.state["spool_error"] = self.state["spool_error_was"] = f"{iso(now_utc())} {type(e).__name__}: {str(e)[:200]}"
+                break
+            os.remove(path)
+            sent += 1
+        else:
+            self.state.pop("spool_error", None)
+        return sent, len(files) - sent
 
     # --- sources: (source name, line, level hint) for everything new since the last tick
     def read_sources(self):
@@ -551,8 +623,27 @@ class Eave:
         if raw:
             written.append(self.put("raw", raw, t))
         written += self.maybe_inventory(t, versions)
-        written += self.answer_asks(t)
+        try:
+            written += self.answer_asks(t)
+        except (OSError, urllib.error.URLError, ValueError, KeyError) as e:   # the store's away: ask again next tick
+            print(f"eaveswatch: asks: {e}", file=sys.stderr, flush=True)
         self.state["last_tick"] = iso(t)
+        # what's been read is spooled (on disk) before the offsets move, so nothing read is ever lost
+        self.trim_spool()
+        self.save()
+        self.last_flush = self.flush()
+        lost = self.state.get("spool_dropped_new", 0)
+        if lost and self.last_flush[1] == 0:
+            # the gap is told once the store's taking files again, in a file of its own (in a spooled one it
+            # could be dropped too), and forgotten only once it's been sent
+            error = self.state.get("spool_error_was") or "the store was unreachable"
+            self.put("packets", [{"source": "eaveswatch", "fp": fingerprint("eaveswatch", "spool dropped"), "level": "error",
+                                  "template": "eaveswatch dropped <n> spooled files: the store was unreachable and the spool full",
+                                  "count": lost, "samples": [f"dropped {lost} spooled files ({error})"], "new": False,
+                                  "spike": False, "usual": 0, "host": cfg["host"], "env": cfg["env"],
+                                  "window": [since, iso(t)], "service": None, "version": None}])
+            if self.flush()[1] == 0:
+                self.state.pop("spool_dropped_new", None)
         self.save()
         return written
 
@@ -574,7 +665,7 @@ class Eave:
             up = None
         return {"host": self.cfg["host"], "env": self.cfg["env"], "fqdn": socket.getfqdn(), "os": osr.get("PRETTY_NAME"),
                 "kernel": os.uname().release, "uptime_s": up, "services": versions if versions is not None else self.versions(),
-                "units": sorted(units), "containers": containers, "eaveswatch": __version__}
+                "units": sorted(units), "containers": containers, "eaveswatch": __version__, "spool": self.spool_stats()}
 
     def flows(self) -> dict:
         return parse_ss(run(["ss", "-Htunap"]), self.cfg["host"])
@@ -585,7 +676,8 @@ class Eave:
             if force and force != kind:
                 continue
             rec = make()
-            h = hashlib.sha256(json.dumps({k: v for k, v in rec.items() if k != "uptime_s"}, sort_keys=True).encode()).hexdigest()
+            h = hashlib.sha256(json.dumps({k: v for k, v in rec.items() if k not in ("uptime_s", "spool")},
+                                          sort_keys=True).encode()).hexdigest()
             last = self.state.get(f"{kind}_sent") or {}
             due = not last or last.get("hash") != h or \
                 (t - parse_iso(last["at"])).total_seconds() >= self.cfg["inventory_every"]
@@ -687,7 +779,7 @@ class Ridge:
     def __init__(self, cfg: dict, store=None):
         self.cfg, self.data = cfg, cfg["ridge"]["data"]
         self.store = store
-        self.state_path = os.path.join(self.data, "sync.json")
+        self.state_path = os.path.join(self.data, "sync.json")     # when the last look back for late files was
 
     def p(self, *parts) -> str:
         return os.path.join(self.data, *parts)
@@ -696,33 +788,34 @@ class Ridge:
         return [safe_name(e) for e in (self.cfg["ridge"]["envs"] or [self.cfg["env"]])]
 
     # --- sync: store -> data folder (inbox/), and outbox/ -> store
-    def sync(self) -> int:
+    def have(self, key: str) -> bool:
+        """Already fetched: it's in the inbox, or watch has archived it. The data folder is the record."""
+        return os.path.exists(self.p("inbox", key)) or os.path.exists(self.p("archive", key))
+
+    def sync(self, deep: bool | None = None) -> int:
+        """New files from the store: the last two hours on every sync, and every late_every seconds the last
+        late_hours too (an eave whose store was away sends its spool late, into the hours the files belong to)."""
         store = self.store or open_store(self.cfg)
         st = read_json(self.state_path, {})
-        t, got = now_utc(), 0
+        t, got, rc = now_utc(), 0, self.cfg["ridge"]
+        if deep is None:
+            deep = not st.get("deep_at") or (t - parse_iso(st["deep_at"])).total_seconds() >= rc["late_every"]
+        hours = max(int(rc["late_hours"]), 2) if deep else 2
         for env in self.envs():
             for kind in RIDGE_READS:
-                ck = f"{env}/{kind}"
-                cur = st.get(ck) or {"hour": iso(t - dt.timedelta(hours=1)), "seen": []}
-                seen = set(cur["seen"])
-                h = parse_iso(cur["hour"]).replace(minute=0, second=0)
-                newest = h
-                while h <= t:
-                    for key in store.list(hour_prefix(env, kind, h)):
-                        if key in seen:
+                for back in range(hours - 1, -1, -1):
+                    for key in store.list(hour_prefix(env, kind, t - dt.timedelta(hours=back))):
+                        if self.have(key):
                             continue
                         dest = self.p("inbox", key)
                         os.makedirs(os.path.dirname(dest), exist_ok=True)
-                        with open(dest, "wb") as f:
+                        tmp = dest + ".part"
+                        with open(tmp, "wb") as f:
                             f.write(store.get(key))
-                        seen.add(key)
+                        os.replace(tmp, dest)
                         got += 1
-                    newest = h
-                    h += dt.timedelta(hours=1)
-                # keep what was seen in the hour before the newest (late writers), and start there next time
-                floor = hour_prefix(env, kind, newest - dt.timedelta(hours=1))
-                st[ck] = {"hour": iso(newest - dt.timedelta(hours=1)),
-                          "seen": sorted(k for k in seen if k[:len(floor)] >= floor)}
+        if deep:
+            st["deep_at"] = iso(t)
         for name in sorted(os.listdir(self.p("outbox"))) if os.path.isdir(self.p("outbox")) else []:
             if not name.endswith(".json"):
                 continue
@@ -737,6 +830,7 @@ class Ridge:
     # --- watch: the inbox -> the map, and a digest of what's worth a look (silence: nothing is)
     def watch(self) -> str:
         inbox = self.p("inbox")
+        # (a file still being fetched is a .part; it waits for the next watch)
         files = sorted(os.path.relpath(os.path.join(d, n), inbox) for d, _, ns in os.walk(inbox) for n in ns
                        if n.endswith(".jsonl.gz")) if os.path.isdir(inbox) else []
         if not files:
@@ -1128,7 +1222,15 @@ def cli(argv: list[str] | None = None) -> None:
         print(object_key(cfg["env"], args.kind, safe_name(args.host or cfg["host"]), now_utc()))
     elif args.cmd == "eave":
         e = Eave(cfg)
-        loop(cfg, args.once, lambda: "\n".join(f"wrote {k}" for k in e.tick()) if args.once else "")
+
+        def eave_tick():
+            keys = e.tick()
+            sent, left = e.last_flush
+            if not args.once:
+                return f"eaveswatch: {left} files waiting to send ({e.state.get('spool_error')})" if left else ""
+            return "\n".join(f"spooled {k}" for k in keys) + f"\nsent {sent}, {left} waiting" + \
+                (f" ({e.state.get('spool_error')})" if left else "")
+        loop(cfg, args.once, eave_tick)
     elif args.cmd == "local":
         e, rd = Eave(cfg), Ridge(cfg)        # the digest is the hobkin's (its wake runs `ridge watch`)
         loop(cfg, args.once, lambda: (e.tick(), "")[1], lambda: (rd.sync(), "")[1])

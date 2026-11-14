@@ -219,6 +219,77 @@ check("[s3] every request's signature matches the URL it went to (prefixes with 
 check("[s3] objects land under the bucket's prefix", all(k.startswith("/bucket/eaves/v1/env=test/kind=") for k in FakeS3.objects),
       list(FakeS3.objects)[:3])
 
+# ---- the spool: a store that's down loses nothing; a full spool drops raw first, and says so
+class Flaky(ew.FolderStore):
+    down = False
+
+    def put(self, key, data):
+        if self.down:
+            raise urllib.error.URLError("store unreachable")
+        super().put(key, data)
+
+    def list(self, prefix):
+        if self.down:
+            raise urllib.error.URLError("store unreachable")
+        return super().list(prefix)
+
+
+import urllib.error
+sbase, slogs, scfgs = setup(tempfile.mkdtemp(prefix="eaveswatch-flaky-"))
+flaky = Flaky(scfgs["web-1"]["store"])
+ev = ew.Eave(scfgs["web-1"], flaky)
+ev.state["started"] = "2020-01-01T00:00:00Z"
+flaky.down = True
+write(f"{slogs}/web-1.log", ["INFO job done in 5ms"] * 7)
+k1 = ev.tick()
+write(f"{slogs}/web-1.log", ["INFO job done in 6ms"] * 5)
+k2 = ev.tick()
+check("[spool] with the store down, ticks spool their files, save their place, and say why",
+      ev.last_flush == (0, len(k1) + len(k2)) and not flaky.list.__func__ is None and "store unreachable" in ev.state["spool_error"]
+      and json.load(open(os.path.join(scfgs["web-1"]["state_dir"], "eave.json")))["files"], (ev.last_flush, k1, k2))
+flaky.down = False
+ev.tick()
+check("[spool] back up: everything is sent, oldest first, and the spool empties",
+      ev.spooled() == [] and "spool_error" not in ev.state and ev.last_flush[1] == 0, ev.spooled())
+rd = ew.Ridge(scfgs["web-1"], flaky)
+rd.sync()
+counted = sum(r["count"] for d, _, ns in os.walk(os.path.join(scfgs["web-1"]["ridge"]["data"], "inbox")) for n in ns
+              if "kind=packets" in d for r in ew.unpack(open(os.path.join(d, n), "rb").read()) if r["template"] == "INFO job done in <n>")
+check("[spool] no line lost across the outage", counted == 12, counted)
+inv = [r for d, _, ns in os.walk(os.path.join(scfgs["web-1"]["ridge"]["data"], "inbox")) for n in ns if "kind=inventory" in d
+       for r in ew.unpack(open(os.path.join(d, n), "rb").read())]
+check("[spool] inventory reports the spool (files, oldest, dropped, last error)",
+      inv and set(inv[0]["spool"]) == {"files", "bytes", "oldest", "dropped", "last_error"}, inv[:1])
+
+scfgs["web-2"]["spool_max_mb"] = 0.002                  # about 2 KB
+ev2 = ew.Eave(scfgs["web-2"], flaky)
+ev2.state["started"] = "2020-01-01T00:00:00Z"
+flaky.down = True
+for i in range(4):
+    write(f"{slogs}/web-2.log", [f"WARN cache miss key-{i}-{j} {'x' * 200}" for j in range(20)])
+    ev2.tick()
+kinds_left = [k for _, k, _ in ev2.spooled()]
+check("[spool] over its cap, the oldest raw files go first",
+      ev2.state.get("spool_dropped", 0) > 0 and sum(b for _, _, b in ev2.spooled()) <= 0.002 * 1024 * 1024
+      and any("kind=packets" in k for k in kinds_left), (ev2.state.get("spool_dropped"), kinds_left))
+flaky.down = False
+ev2.tick()
+gap = [r for k in flaky.list("env=test/kind=packets/") if "host=web-2" in k for r in ew.unpack(flaky.get(k))
+       if r["source"] == "eaveswatch"]
+check("[spool] what was dropped is reported once, as an error the ridge will see, once the store's back",
+      len(gap) == 1 and gap[0]["level"] == "error" and gap[0]["count"] == ev2.state["spool_dropped"]
+      and "store unreachable" in gap[0]["samples"][0] and "spool_dropped_new" not in ev2.state, gap)
+
+# late arrivals: a file for an hour the ridge has passed is found by the next look back
+rd.sync(deep=True)
+late = ew.object_key("test", "packets", "web-9", ew.now_utc() - ew.dt.timedelta(hours=5))
+flaky.put(late, ew.pack([{"fp": "late1", "template": "late", "count": 1, "host": "web-9", "window": ["", ""]}]))
+check("[ridge] a late file for an old hour waits for the look back, then arrives once",
+      rd.sync(deep=False) == 0 and rd.sync(deep=True) == 1 and rd.sync(deep=True) == 0)
+rd.watch()
+check("[ridge] fetched files are remembered by the data folder itself (archived ones too)",
+      rd.have(late) and rd.sync(deep=True) == 0)
+
 # ---- findings
 cfg = cfgs["web-1"]
 good = {"category": "security/authz", "location": "api src/auth.py:88", "claim": "c", "evidence": "e", "scenario": "s",

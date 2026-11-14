@@ -40,6 +40,18 @@ PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=web-3/web-3_20261114T091
 - **Kinds:** `packets` (templates, counts, new and spiking), `inventory`,
   `flows`, `raw` (opt-in per source: redacted lines, the archive), `requests`
   (ridge → eave) and `answers` (eave → ridge).
+- **Nothing is lost when the store is away.** An eave writes every file to
+  its spool (`STATE_DIR/spool/`) and saves its place in the logs only after
+  that. It then sends the spool oldest first, deleting each file once it's
+  stored. While S3 is unreachable the spool grows and inventory reports it.
+  Past `spool_max_mb` the oldest `raw` files are dropped first, then the
+  oldest of anything. Once the store is back, the eave sends one error-level
+  packet saying how many were dropped, so the gap shows up in a digest.
+  Delivery is at least once: a crash between spooling and saving sends a few
+  lines twice.
+- **Late files keep their hour.** A spooled file lands in the hour it was
+  made. Every `late_every` seconds the ridge looks back `late_hours`, and
+  anything already in its data folder counts as fetched.
 - **Retention** is S3 lifecycle rules (say, `kind=raw` to Glacier after 30
   days), not code.
 
@@ -163,7 +175,8 @@ eaveswatch finding status F-1a2b3c4d dismissed --why "behind the VPN only"
 | `spike` | `4.0` | × the usual count (and at least 10) |
 | `warmup_minutes` | `60` | learning time before "new" means anything |
 | `inventory_every` | `3600` | inventory and flows: on change, and at least this often |
-| `ridge` | | `data` (folder), `envs` (which to read), `silent_after` (seconds) |
+| `spool_max_mb` | `512` | the most an eave keeps waiting for the store before it drops the oldest |
+| `ridge` | | `data` (folder), `envs` (which to read), `silent_after` (seconds), `late_hours` (`24`) and `late_every` (`600` s): the look back for late files |
 
 ## Tests
 
