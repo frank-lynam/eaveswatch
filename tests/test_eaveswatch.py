@@ -941,6 +941,9 @@ na, nb = ew.Node(s3a), ew.Node(s3b)
 na.tick(); nb.tick()
 sj = na.make_job("test:s3", "on S3", "s3b", "x", priority=0)
 nb.tick(); na.tick()
+ctext, _ = ew.run_check(s3a, "x", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
+check("[check] the store is checked for conditional writes (the lease and claims rely on them)",
+      "ok    store: conditional writes: honoured" in ctext, ctext)
 check("[cluster] on S3: one ridge holder, and a job claimed once (conditional writes)",
       na.leading != nb.leading and nb.st.get("active") in (sj or "") and na.st.get("active") not in (sj or "x"), (na.leading, nb.leading, nb.st))
 

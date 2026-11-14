@@ -2710,6 +2710,22 @@ def check_store(c: Check, cfg: dict, store, role: str) -> None:
                                               store.list(sys_key(cfg, "nodes") + "/")), fix)
         if ok:
             c.ok("store: system state", f"systems/system={cfg['system']}/ (write, read, list, delete)")
+            ck = sys_key(cfg, f".check-cond-{secrets.token_hex(3)}")       # the lease and claims depend on these
+            try:
+                store.put(ck, b"1", if_none_match=True)
+                try:
+                    store.put(ck, b"2", if_none_match=True)
+                    c.fail("store: conditional writes", "a create-if-absent write went through twice",
+                           "this store ignores If-None-Match: nodes can't share a system on it (one node is fine)")
+                except Conflict:
+                    c.ok("store: conditional writes", "honoured (the ridge lease and review claims rely on them)")
+            except (OSError, urllib.error.URLError, ValueError) as e:
+                c.fail("store: conditional writes", str(getattr(e, "reason", e)), "this store must honour If-None-Match and If-Match")
+            finally:
+                try:
+                    store.delete(ck)
+                except (OSError, urllib.error.URLError):
+                    pass
     if role == "finial":
         pass                                      # a finial only writes: its asks and its ridge are right here
     elif role == "eave":
