@@ -75,8 +75,8 @@ Everything else is decided for you:
   safe mode refuses write folders inside `~/.something`, because those are
   ways out of the sandbox.
 
-It runs `check`, installs and starts the `eaveswatch-finial` user service,
-turns on lingering (so the services run with nobody logged in), installs the
+It runs `check`, installs and starts `eaveswatch` as a user service of whoever
+ran it, turns on lingering (so it runs with nobody logged in), installs the
 reviewer's instructions as a hobkin chore, and hands over to hobkin. You end up
 in a chat with the reviewer. Run it again later and it reuses the same setup.
 `--reviewer none` sets everything up without starting an agent, for a harness
@@ -183,6 +183,35 @@ has (instance profile, environment, `~/.aws`) and only needs the bucket name.
 `cluster` in the config tunes the timings: `lease_seconds` (180),
 `claim_seconds` (600), `job_wait_seconds` (120), `node_gone_seconds` (300),
 `job_keep_days` (7).
+
+## Running as a service
+
+eaveswatch runs as a **systemd user service of whoever launches it**, like
+hobkin. That's normally the user the watched services run as. `setup` and
+`boot` install it; you can manage it yourself too:
+
+```sh
+eaveswatch --config ~/.config/eaveswatch/finial.json service add      # install, start now and at boot
+eaveswatch --config ~/.config/eaveswatch/finial.json service status   # running? since when; its last lines
+eaveswatch --config ~/.config/eaveswatch/finial.json service remove   # stop it and take it off boot
+```
+
+- **The unit:** `~/.config/systemd/user/eaveswatch.service`, running this same
+  eaveswatch (its full path) with this config. Another config gets its own unit
+  (`eaveswatch-<hash>`), so two setups on one box never clash.
+- **Lingering** is turned on, so it runs with nobody logged in. If the system
+  won't allow that without a password, it says so and gives the
+  `loginctl enable-linger USER` to run.
+- **Failures:** a crash is restarted after 30 seconds. systemd gives up after 5
+  failures in 10 minutes, so a broken config can't spin. A clean stop
+  (`systemctl --user stop eaveswatch`, scale-in) stays stopped, and the node
+  hands its work back first.
+- **Logs:** its own output goes to the journal
+  (`journalctl --user -u eaveswatch`).
+- **Overwriting:** a unit that already runs a different eaveswatch or config is
+  left alone unless you pass `--force`. `boot` replaces it, since it owns it.
+- The reviewer is its harness's service. For hobkin that's `hobkin@eaveswatch`,
+  which `hobkin list` shows.
 
 ## Alerts and the findings page
 

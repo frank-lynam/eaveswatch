@@ -20,6 +20,7 @@ for hobkin; any harness that meets `eaveswatch reviewer contract` can be the rev
     eaveswatch finding list [--all]             open findings (--all: every one)
     eaveswatch finding status ID STATUS [--why TEXT]    accepted, fixed, dismissed (with why), reopened
     eaveswatch notify TEXT [--severity page]    a note for the person (queued; the loop sends it): --test sends one now
+    eaveswatch service add|remove|status        this config as a user service of whoever runs it (now and at boot)
     eaveswatch check                            is this set up right? store, credentials, clock, interpreter, sources
     eaveswatch reviewer contract|instructions   what an agent harness needs to be the reviewer
     eaveswatch reviewer install hobkin          the hobkin adapter: its chore, where hobkin finds chores by name
@@ -55,7 +56,7 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   command line
 from __future__ import annotations
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 import argparse
 import configparser
@@ -2941,14 +2942,17 @@ def run_check(cfg: dict, path: str | None, store=None) -> tuple[str, int]:
 # fixed folders, the instance's credentials and region. Then hobkin's own one-line setup, with the chore.
 SETUP_CONFIG = "~/.config/eaveswatch/finial.json"
 SETUP_STATE = "~/eaveswatch"                      # not under a dot-folder: hobkin's safe mode won't write there
-FINIAL_UNIT = """[Unit]
-Description=eaveswatch finial: this box's logs, interpreted, to the store and the reviewer
+SERVICE_UNIT = """[Unit]
+Description=eaveswatch ({config})
 After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 ExecStart={cmd} --config {config} finial
-Restart=always
-RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=30
 
 [Install]
 WantedBy=default.target
@@ -3115,31 +3119,74 @@ def setup(argv: list[str]) -> None:
                                 f"starting the reviewer ({a.reviewer}): it looks at this box, then asks you what you care about")
 
 
-def install_finial_unit(cfg_path: str, no_service: bool, force: bool) -> None:
-    """The finial as a user service, started now and at boot (with linger, while nobody's logged in)."""
-    cmd = eaveswatch_cmd()
-    if no_service:
-        print(f"not installing services: run `{cmd} --config {cfg_path} finial` yourself")
-        return
-    unit_dir = os.path.expanduser("~/.config/systemd/user")
-    unit = os.path.join(unit_dir, "eaveswatch-finial.service")
-    want = FINIAL_UNIT.format(cmd=cmd, config=cfg_path)
+# --- service: eaveswatch as a systemd user service of whoever runs it (like hobkin's), now and at boot
+def unit_name(cfg_path: str) -> str:
+    """eaveswatch for the default config; another config gets its own unit, so two setups on a box never clash."""
+    real = os.path.realpath(os.path.expanduser(cfg_path))
+    if real == os.path.realpath(os.path.expanduser(SETUP_CONFIG)):
+        return "eaveswatch"
+    return "eaveswatch-" + hashlib.sha256(real.encode()).hexdigest()[:6]
+
+
+def unit_path(cfg_path: str) -> str:
+    return os.path.join(os.path.expanduser("~/.config/systemd/user"), unit_name(cfg_path) + ".service")
+
+
+def service_add(cfg_path: str, force: bool = False) -> str:
+    """Install this config's user unit (running this same eaveswatch), enable and start it, and turn on linger so
+    it runs with nobody logged in. A unit that runs another eaveswatch or config is left alone unless `force`."""
+    cfg_path = os.path.abspath(os.path.expanduser(cfg_path))
+    unit, name = unit_path(cfg_path), unit_name(cfg_path)
+    want = SERVICE_UNIT.format(cmd=eaveswatch_cmd(), config=cfg_path)
     if os.path.exists(unit) and _read(unit) != want and not force:
-        print(f"leaving {unit} as it is (it differs; --force replaces it)")
-    else:
-        os.makedirs(unit_dir, exist_ok=True)
-        with open(unit, "w") as f:
-            f.write(want)
-    for c in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", "eaveswatch-finial"]):
+        old = re.search(r"^ExecStart=(.*)$", _read(unit), re.M)
+        raise ValueError(f"{unit} already runs {old.group(1) if old else 'something else'}: leaving it alone (--force replaces it)")
+    os.makedirs(os.path.dirname(unit), exist_ok=True)
+    with open(unit, "w") as f:
+        f.write(want)
+    for c in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", name],
+              ["systemctl", "--user", "restart", name]):
         r = subprocess.run(c, capture_output=True, text=True)
         if r.returncode:
-            sys.exit(f"eaveswatch: {' '.join(c)} failed: {r.stderr.strip()} (no user systemd here? try --no-service)")
-    user = pwd.getpwuid(os.getuid()).pw_name
+            raise ValueError(f"{' '.join(c)} failed: {r.stderr.strip()} (no user systemd here? run it yourself, or --no-service)")
+    user, said = pwd.getpwuid(os.getuid()).pw_name, ""
     if "Linger=no" in run(["loginctl", "show-user", user, "-p", "Linger"]):
         r = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        print("turned on linger: the services run with nobody logged in" if r.returncode == 0 else
-              f"note: couldn't turn on linger ({r.stderr.strip()}): an admin can, with `loginctl enable-linger {user}`")
-    print("started eaveswatch-finial (a user service: systemctl --user status eaveswatch-finial)")
+        said = ("; turned on linger: it runs with nobody logged in" if r.returncode == 0 else
+                f"; note: couldn't turn on linger ({r.stderr.strip()}): `loginctl enable-linger {user}` (an admin may need to)")
+    return f"{name}: a user service of {user}, started now and at boot (systemctl --user status {name}){said}"
+
+
+def service_remove(cfg_path: str) -> str:
+    name, unit = unit_name(cfg_path), unit_path(cfg_path)
+    if not os.path.exists(unit):
+        return f"{name}: no such service"
+    subprocess.run(["systemctl", "--user", "disable", "--now", name], capture_output=True, text=True)
+    os.remove(unit)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+    return f"{name}: stopped and taken off boot"
+
+
+def service_status(cfg_path: str) -> str:
+    name = unit_name(cfg_path)
+    if not os.path.exists(unit_path(cfg_path)):
+        return f"{name}: not a service (eaveswatch service add)"
+    state = run(["systemctl", "--user", "is-active", name]).strip() or "unknown"
+    since = run(["systemctl", "--user", "show", name, "-p", "ActiveEnterTimestamp", "--value"]).strip()
+    log = run(["journalctl", "--user", "-u", name, "-n", "8", "--no-pager", "-o", "cat"]).strip()
+    return f"{name}: {state}" + (f" since {since}" if since and state == "active" else "") + (f"\n{log}" if log else "")
+
+
+def install_finial_unit(cfg_path: str, no_service: bool, force: bool) -> None:
+    """For setup and boot: the service, unless asked not to."""
+    if no_service:
+        print(f"not installing services: run `{eaveswatch_cmd()} --config {cfg_path} finial` yourself, "
+              f"or `eaveswatch --config {cfg_path} service add`")
+        return
+    try:
+        print(service_add(cfg_path, force))
+    except ValueError as e:
+        sys.exit(f"eaveswatch: {e}")
 
 
 # ---- cluster: every instance of a system runs the same thing (a finial); what the system knows lives in the
@@ -3834,6 +3881,9 @@ def cli(argv: list[str] | None = None) -> None:
     f.add_argument("--why")
     f.add_argument("--all", action="store_true")
     sub.add_parser("check")
+    sv = sub.add_parser("service", help="this config as a systemd user service of whoever runs it: add, remove, status")
+    sv.add_argument("action", choices=("add", "remove", "status"))
+    sv.add_argument("--force", action="store_true", help="add: replace a unit that runs another eaveswatch or config")
     sub.add_parser("watch", help="for the reviewer's wake: this node's claimed review, answers, notes; or nothing")
     jb = sub.add_parser("job", help="the reviewer's side of a review job")
     jb.add_argument("action", choices=("done", "release", "list"))
@@ -3900,6 +3950,14 @@ def cli(argv: list[str] | None = None) -> None:
             os.makedirs(os.path.join(data, "jobs", "release"), exist_ok=True)
             open(os.path.join(data, "jobs", "release", args.id), "w").close()
             print(f"job {args.id}: given back (another node will take it)")
+        return
+    if args.cmd == "service":
+        path = os.path.abspath(os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json"))
+        try:
+            print(service_add(path, args.force) if args.action == "add" else
+                  service_remove(path) if args.action == "remove" else service_status(path))
+        except ValueError as e:
+            sys.exit(f"eaveswatch: {e}")
         return
     if args.cmd == "reviewer":
         path = os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json")

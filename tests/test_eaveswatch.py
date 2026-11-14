@@ -970,5 +970,52 @@ check("[check] the store is checked for conditional writes (the lease and claims
 check("[cluster] on S3: one ridge holder, and a job claimed once (conditional writes)",
       na.leading != nb.leading and nb.st.get("active") in (sj or "") and na.st.get("active") not in (sj or "x"), (na.leading, nb.leading, nb.st))
 
+# ---- the service: a systemd user unit of whoever runs it, like hobkin's
+sv_cfg = os.path.join(tempfile.mkdtemp(prefix="eaveswatch-svc-"), "svc.json")
+json.dump({"role": "finial", "env": "test", "host": "svc1", "store": os.path.join(os.path.dirname(sv_cfg), "store"),
+           "state_dir": os.path.join(os.path.dirname(sv_cfg), "state"), "every": 5}, open(sv_cfg, "w"))
+unit_text = ew.SERVICE_UNIT.format(cmd="/x/eaveswatch", config=sv_cfg)
+check("[service] the unit: this eaveswatch and config, restarted on failure (not after a clean stop), gives up on a crash loop",
+      f"ExecStart=/x/eaveswatch --config {sv_cfg} finial" in unit_text and "Restart=on-failure" in unit_text
+      and "StartLimitBurst=5" in unit_text and "PYTHONUNBUFFERED=1" in unit_text and "WantedBy=default.target" in unit_text)
+check("[service] the default config is eaveswatch.service; another config gets its own unit, so they never clash",
+      ew.unit_name(ew.SETUP_CONFIG) == "eaveswatch" and re.fullmatch(r"eaveswatch-[0-9a-f]{6}", ew.unit_name(sv_cfg)))
+fake_home = tempfile.mkdtemp()
+real_home, os.environ["HOME"] = os.environ.get("HOME"), fake_home
+os.makedirs(os.path.dirname(ew.unit_path(sv_cfg)))
+open(ew.unit_path(sv_cfg), "w").write("[Service]\nExecStart=/somewhere/else/eaveswatch --config other finial\n")
+try:
+    ew.service_add(sv_cfg)
+    refused = ""
+except ValueError as e:
+    refused = str(e)
+os.environ["HOME"] = real_home
+check("[service] a unit running another eaveswatch or config is left alone without --force",
+      "leaving it alone (--force replaces it)" in refused and "/somewhere/else" in refused, refused)
+if subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True).stdout.strip() in ("running", "degraded"):
+    try:
+        added = ew.service_add(sv_cfg)
+        name = ew.unit_name(sv_cfg)
+        up = False
+        for _ in range(40):
+            if subprocess.run(["systemctl", "--user", "is-active", name], capture_output=True, text=True).stdout.strip() == "active" \
+                    and os.path.exists(os.path.join(os.path.dirname(sv_cfg), "state", "eave.json")):
+                up = True
+                break
+            time.sleep(0.5)
+        status = ew.service_status(sv_cfg)
+        check("[service] add: installed for this user, running now (the finial ticking), enabled for boot, status shows it",
+              up and f"{name}: a user service of" in added and status.startswith(f"{name}: active")
+              and subprocess.run(["systemctl", "--user", "is-enabled", name], capture_output=True, text=True).stdout.strip() == "enabled",
+              (added, status))
+    finally:
+        removed = ew.service_remove(sv_cfg)
+    check("[service] remove: stopped, off boot, the unit gone",
+          "stopped and taken off boot" in removed and not os.path.exists(ew.unit_path(sv_cfg))
+          and subprocess.run(["systemctl", "--user", "is-active", ew.unit_name(sv_cfg)], capture_output=True, text=True).stdout.strip() != "active",
+          removed)
+else:
+    print("SKIP [service] no systemd user session here")
+
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
 sys.exit(1 if FAILED else 0)
