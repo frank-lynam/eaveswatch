@@ -99,10 +99,48 @@ Discovery runs again every hour. What changed (new units, programs,
 listeners, logs written but not collected) comes in its digest. It fixes and
 narrows the interpreter on its own, and asks you before adding a source.
 
-IAM for a finial is one permission: `s3:PutObject` on `PREFIX/*/host=HOST/*`.
-`eaveswatch iam` prints that exact policy for this box. If the credentials can
+IAM for a finial: `s3:PutObject` on `PREFIX/*/host=HOST/*`, plus read and write
+on its system's profile (`PREFIX/profiles/system=NAME/*`). `eaveswatch iam`
+prints that exact policy for this box. If the credentials can
 do far more (an instance profile with full S3 access, say), `check` says so,
 and the reviewer raises it at setup.
+
+## An autoscaling group: profiles
+
+Each system's setup lives in the store, so a new instance sets itself up with
+nothing asked:
+
+```
+PREFIX/profiles/system=ps-hr-app/profile.json                 the latest
+PREFIX/profiles/system=ps-hr-app/history/profile_STAMP_RAND.json   every version before it
+```
+
+- **What's in it:** the config, minus the host and this machine's folders; the
+  active interpreter, with its alert rules; the reviewer's charter
+  (`REVIEW.md`); the reviewer's model API and the *name* of the environment
+  variable that holds its key; and the dismissed findings with their reasons.
+  Never a secret, and never one machine's state (offsets, baselines, the map).
+- **Saved by itself:** the loop saves it whenever it changes (a new interpreter,
+  an edited charter, a dismissal). `eaveswatch save` does it now.
+- **Restored by one command** from an instance's user-data
+  ([examples/asg/user-data.sh](examples/asg/user-data.sh)):
+
+  ```sh
+  eaveswatch restore s3://my-eaves-bucket/eaveswatch ps-hr-app
+  ```
+
+  It writes the config with this instance's own host, installs the interpreter
+  (validated but not replayed, since the services may still be starting),
+  writes the charter, keeps dismissed findings dismissed, runs `check`,
+  starts the user service, and starts the reviewer with its key from
+  `$EAVESWATCH_MODEL_KEY` (or whichever variable the profile names). No chat,
+  since nobody's there. The reviewer sees it was restored, checks the setup
+  against this box, fixes what differs, and tells you.
+- **Set the first instance up with `--system NAME`**, the name every instance
+  of the group shares. It defaults to the hostname, which an ASG doesn't keep.
+  `--key-env` names the variable new instances will find the key in.
+- hobkin keeps the key it's given in its own key file, readable only by that
+  user. AWS credentials come from the instance profile.
 
 ## Alerts and the findings page
 
@@ -182,6 +220,8 @@ PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=ps-hr-01/ps-hr-01_202611
   - `requests` and `answers`: asks
   - `alerts`: what fired, and why
   - `check`: probes, which a lifecycle rule can expire
+- **Profiles** sit beside the data, at `PREFIX/profiles/system=NAME/` (see
+  "An autoscaling group").
 - **Nothing is lost when the store is away.** Every file is spooled to disk
   before the eave saves its place in the logs, then sent oldest first. Past
   `spool_max_mb` the oldest `raw` files go first, and the gap is reported
@@ -256,6 +296,7 @@ Plumbing only; what to collect is the interpreter's.
 | `role` | `eave` | `eave`, `ridge` or `finial` |
 | `env` | `prod` | the `env=` prefix |
 | `host` | hostname | the `host=` prefix |
+| `system` | host | the name instances of one system share (an ASG's): its profile in the store |
 | `store` | | a folder, or `s3://bucket/prefix` |
 | `region`, `endpoint` | `$AWS_REGION` | S3 region; an S3-compatible endpoint (path-style) |
 | `state_dir` | `/var/lib/eaveswatch` | offsets, cursors, baselines, the spool; the ridge's data default |

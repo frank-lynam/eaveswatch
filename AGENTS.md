@@ -12,7 +12,9 @@
   always on, and a spec can only add to them. Never make either configurable away.
 - **The store layout is a contract** (Athena tables and IAM policies are written against it):
   `PREFIX/env=/kind=/dt=YYYY-MM-DD/hour=HH/host=/HOST_STAMP_RAND.jsonl.gz`, gzipped JSON lines. Change it only
-  on purpose, with the README.
+  on purpose, with the README. Systems' profiles live beside it at `PREFIX/profiles/system=NAME/` (`profile.json`,
+  `history/`): config without host or folders, the interpreter, the charter, the reviewer's API and its key's
+  variable name, dismissals. Never a secret, never one machine's state.
 - **Nothing leaves a host unredacted.** Redaction runs before templating, samples, raw, answers and discovery
   samples. A new output path goes through the interpreter's `redact` too. Discovery lists config files, never
   reads them out; watched files are hashed, never sent.

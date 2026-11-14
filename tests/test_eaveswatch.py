@@ -367,8 +367,9 @@ check("[check] an eave on S3: credentials (key masked), a probe under its own ho
 FakeS3.deny_put = True
 text, problems = ew.run_check(s3cfg, "test.json", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
 FakeS3.deny_put = False
-check("[check] S3 refusing says S3's own reason and the permission to add",
-      problems == 1 and "FAIL  store: write: 403 AccessDenied: Access Denied" in text
+check("[check] S3 refusing says S3's own reason and the permission to add (its files, and its system's profile)",
+      problems == 2 and "FAIL  store: write: 403 AccessDenied: Access Denied" in text
+      and "fix: allow s3:GetObject and s3:PutObject on s3://bucket/eaves/v1/profiles/system=web-7/*" in text
       and "fix: allow s3:PutObject on s3://bucket/eaves/v1/*/host=web-7/*" in text, text)
 rd_text, rd_problems = ew.run_check({**s3cfg, "role": "ridge"}, "test.json", s3)
 check("[check] a ridge on S3: lists and reads each kind it syncs", rd_problems == 0
@@ -447,7 +448,7 @@ check("[check] a good eave: the interpreter, its sources and services, a preview
       problems == 0 and "all good" in text and "ok    interpreter: v1: 1 sources, 1 services" in text
       and "1x  [app] INFO request ok in <n> token=<redacted>" in text and "1 values redacted" in text
       and "watched files: 1 hashed" in text and "abc123secret" not in text
-      and not [k for k in ew.FolderStore(good_cfg["store"]).list("") if "kind=check" not in k], text)
+      and not [k for k in ew.FolderStore(good_cfg["store"]).list("") if "kind=check" not in k and not k.endswith("/.check")], text)
 d = good_cfg["interpreter"]
 v1 = json.load(open(os.path.join(d, "v1.json")))
 json.dump({**v1, "sources": v1["sources"] + [{"name": "nginx", "path": "/nonexistent/*.log"}],
@@ -732,10 +733,16 @@ check("[notify] hobkin's alert_command ($HOBKIN_ALERT) is queued for the person"
                                                            for n in q()), on.stdout + on.stderr)
 ot = cli("--config", acfg_path, "notify", "--test")
 check("[notify] --test sends one now", ot.returncode == 0 and "sent" in ot.stdout and "test note" in open(mailbox).read(), ot.stdout + ot.stderr)
-oi = cli("--config", acfg_path, "iam")
+iam_path = os.path.join(ab, "iam.json")
+json.dump({"store": "s3://my-bucket/eaveswatch", "env": "prod", "host": "ps1", "system": "ps-hr", "role": "finial",
+           "state_dir": os.path.join(ab, "iam")}, open(iam_path, "w"))
+oi = cli("--config", iam_path, "iam")
 pol = json.loads(oi.stdout) if oi.returncode == 0 else {}
-check("[iam] the least a finial needs: one PutObject on its own host's prefix",
-      [st["Action"] for st in pol.get("Statement", [])] == ["s3:PutObject"] and pol["Statement"][0]["Resource"].endswith("*/host=ps1/*"), oi.stdout)
+check("[iam] the least a finial needs: write under its own host, read and write its system's profile",
+      [st["Sid"] for st in pol.get("Statement", [])] == ["WriteOwnHost", "SystemProfile"]
+      and pol["Statement"][0]["Resource"] == "arn:aws:s3:::my-bucket/eaveswatch/*/host=ps1/*"
+      and pol["Statement"][1]["Resource"] == "arn:aws:s3:::my-bucket/eaveswatch/profiles/system=ps-hr/*", oi.stdout)
+check("[iam] a folder store needs no policy, and says so", "no IAM policy needed" in cli("--config", acfg_path, "iam").stderr)
 s3f = ew.make_config({"store": "s3://bucket/eaves/v1", "env": "test", "host": "ps9", "role": "finial", "state_dir": tempfile.mkdtemp()})
 btext, _ = ew.run_check(s3f, "x", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
 check("[check] credentials that can list every bucket are noticed, and `iam` named", "warn  credentials: they can list every bucket (2)" in btext
@@ -763,6 +770,75 @@ check("[setup] where alerts go and the web folder for the findings page, from fl
       c5.get("notify", {}).get("email") == "me@example.test" and c5.get("notify", {}).get("smtp", "").startswith("127.0.0.1:")
       and c5.get("publish", {}).get("dir") == os.path.join(sh2, "www")
       and "anyone who can reach that site sees the findings" in o5.stdout, o5.stdout + o5.stderr)
+
+# ---- profiles: a system's setup saved in the store, restored on a new instance from its environment
+pb = tempfile.mkdtemp(prefix="eaveswatch-profile-")
+pstore = os.path.join(pb, "store")
+pcfg_path = os.path.join(pb, "a.json")
+json.dump({"role": "finial", "env": "test", "host": "ip-10-0-1-5", "system": "ps-hr-app", "store": pstore,
+           "state_dir": os.path.join(pb, "a"), "notify": {"email": "me@example.test", "smtp": f"127.0.0.1:{smtp.server_address[1]}"}},
+          open(pcfg_path, "w"))
+pcfg = ew.load_config(pcfg_path)
+plog = os.path.join(pb, "APPSRV_1114.LOG")
+write(plog, ["PSAPPSRV.1 (3) started"])
+pspec = {"sources": [{"name": "appsrv", "path": os.path.join(pb, "APPSRV_*.LOG")}],
+         "alerts": [{"name": "unit", "unit_failed": ["psappsrv.service"], "severity": "page"}], "warmup_minutes": 0}
+ew.apply_spec(pcfg, spec_file(pspec, pb), "first")
+os.makedirs(pcfg["ridge"]["data"], exist_ok=True)
+open(os.path.join(pcfg["ridge"]["data"], "REVIEW.md"), "w").write("# PeopleSoft HR\nSign-on failures matter.\n")
+ew.write_json(os.path.join(pcfg["ridge"]["data"], "reviewer.json"), {"url": "https://api.example.test/v1", "model": "m",
+                                                                     "key_env": "EAVESWATCH_MODEL_KEY"})
+dis = {"category": "security/exposure", "location": "pia :8000", "claim": "c", "evidence": "e", "scenario": "s", "action": "a",
+       "confidence": "low"}
+fid = ew.finding_add(pcfg, dis).split()[0]
+ew.finding_status(pcfg, fid, "dismissed", "internal only, behind the ALB")
+k1 = ew.save_profile(pcfg, pcfg_path)
+prof = json.loads(ew.FolderStore(pstore).get("profiles/system=ps-hr-app/profile.json"))
+check("[profile] saved to the store: config (not the host or its folders), interpreter and alert rules, charter, reviewer (no key), dismissals",
+      k1 == "profiles/system=ps-hr-app/profile.json" and "host" not in prof["config"] and "state_dir" not in prof["config"] and prof["config"]["system"] == "ps-hr-app"
+      and prof["interpreter"]["spec"]["alerts"][0]["name"] == "unit" and "Sign-on failures" in prof["charter"]
+      and prof["reviewer"] == {"url": "https://api.example.test/v1", "model": "m", "key_env": "EAVESWATCH_MODEL_KEY"}
+      and prof["dismissed"][0]["why"] == "internal only, behind the ALB" and "sk-" not in json.dumps(prof), prof)
+check("[profile] unchanged, it isn't saved again", ew.save_profile(pcfg, pcfg_path) is None)
+ew.apply_spec(pcfg, spec_file({**pspec, "about": "v2"}, pb), "second")
+ew.save_profile(pcfg, pcfg_path)
+hist = ew.FolderStore(pstore).list("profiles/system=ps-hr-app/history/")
+check("[profile] a change (a new interpreter) saves again, the old version kept in history", len(hist) == 2, hist)
+check("[iam] a finial may read and write its system's profile, and nothing else of the store's but its own host",
+      any(st["Sid"] == "SystemProfile" and st["Resource"].endswith("profiles/system=ps-hr-app/*") for st in ew.iam_policy(pcfg)["Statement"]))
+# a new instance: no questions, the key from the environment
+nb = tempfile.mkdtemp(prefix="eaveswatch-restore-")
+open(os.path.join(nb, "fake_hobkin.py"), "w").write("import json,sys; json.dump(sys.argv[1:], open(sys.argv[0] + '.out', 'w'))")
+renv = {**os.environ, "HOME": nb, "HOBKIN_HOME": os.path.join(nb, ".hobkins"), "EAVESWATCH_MODEL_KEY": "sk-from-env",
+        "EAVESWATCH_HOBKIN": f"{sys.executable} {os.path.join(nb, 'fake_hobkin.py')}"}
+r1 = subprocess.run([sys.executable, EW, "restore", pstore, "ps-hr-app", "--no-service", "--host", "ip-10-0-2-9"],
+                    capture_output=True, text=True, env=renv, stdin=subprocess.DEVNULL)
+real_home, os.environ["HOME"] = os.environ.get("HOME"), nb          # its config's ~ is that instance's home
+ncfg = ew.load_config(os.path.join(nb, ".config", "eaveswatch", "finial.json")) if r1.returncode == 0 else None
+os.environ["HOME"] = real_home
+hargs = json.load(open(os.path.join(nb, "fake_hobkin.py.out"))) if os.path.exists(os.path.join(nb, "fake_hobkin.py.out")) else []
+check("[restore] a new instance sets itself up from the profile: its own host, the system's interpreter, alerts and charter",
+      ncfg and ncfg["host"] == "ip-10-0-2-9" and ncfg["system"] == "ps-hr-app" and ncfg["notify"]["email"] == "me@example.test"
+      and ncfg["state_dir"] == os.path.join(nb, "eaveswatch")
+      and ew.active_spec(ncfg)[0].get("about") == "v2" and ew.active_spec(ncfg)[1] == 1
+      and "Sign-on failures" in open(os.path.join(ncfg["ridge"]["data"], "REVIEW.md")).read()
+      and os.path.exists(os.path.join(ncfg["ridge"]["data"], "restored.json")), r1.stdout + r1.stderr)
+check("[restore] dismissed stays dismissed on the new instance", ncfg and "was dismissed (internal only, behind the ALB)"
+      in ew.finding_add(ncfg, dis))
+check("[restore] the reviewer starts with its key from the environment, and no chat (nobody's there)",
+      hargs[:3] == ["https://api.example.test/v1", "m", "sk-from-env"] and "--chore" in hargs and "--chat" not in hargs
+      and "--no-service" in hargs, hargs)
+r2 = subprocess.run([sys.executable, EW, "restore", pstore, "ps-hr-app", "--no-service"], capture_output=True, text=True,
+                    env=renv, stdin=subprocess.DEVNULL)
+check("[restore] a box already set up isn't overwritten without --force", r2.returncode != 0 and "--force" in r2.stderr, r2.stderr)
+nb2 = tempfile.mkdtemp(prefix="eaveswatch-restore2-")
+r3 = subprocess.run([sys.executable, EW, "restore", pstore, "ps-hr-app", "--no-service"], capture_output=True, text=True,
+                    env={**renv, "HOME": nb2, "EAVESWATCH_MODEL_KEY": ""}, stdin=subprocess.DEVNULL)
+check("[restore] without the key in the environment, it says which variable to set",
+      r3.returncode != 0 and "$EAVESWATCH_MODEL_KEY" in r3.stderr, r3.stderr)
+r4 = subprocess.run([sys.executable, EW, "restore", pstore, "no-such-system", "--no-service"], capture_output=True, text=True,
+                    env={**renv, "HOME": tempfile.mkdtemp()}, stdin=subprocess.DEVNULL)
+check("[restore] no profile for that system: it says how one gets made", r4.returncode != 0 and "--system NAME" in r4.stderr, r4.stderr)
 
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
 sys.exit(1 if FAILED else 0)

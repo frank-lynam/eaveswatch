@@ -2,6 +2,7 @@
 """eaveswatch: logs, inventory and connections from every host, interpreted by a hobkin and reviewed by one.
 
     eaveswatch URL MODEL [KEY]        set this box up as a finial and start its reviewer, in one go (asks for a bucket)
+    eaveswatch restore STORE SYSTEM   a new instance (an ASG's) sets itself up from its system's saved profile
     eaveswatch eave   [--once]        on a host: its interpreter's sources -> templates and counts; inventory, flows;
                                       all spooled, then sent to the store; answers the ridge's asks
     eaveswatch ridge  [sync] [--once] the hub's loop (no model): new files from the store -> the data folder
@@ -46,10 +47,11 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   the reviewer the hobkin chore (chore.json, CHORE.md), written out by `eaveswatch chore`
 #   check        `eaveswatch check`: each role's permissions, the interpreter, sources, versions, clock, a preview
 #   setup        `eaveswatch URL MODEL [KEY]`: a finial in one command, then hobkin's own setup with the chore
+#   profiles     a system's setup saved in the store (by the loop) and `eaveswatch restore`d on a new instance
 #   command line
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import argparse
 import configparser
@@ -80,6 +82,7 @@ DEFAULTS = {
     "role": "eave",              # eave | ridge | finial
     "env": "prod",               # the env= prefix: one store can hold several environments
     "host": None,                # the host= prefix; default: this machine's hostname
+    "system": None,              # what instances of one system share (an ASG's): its profile in the store; default: host
     "store": None,               # a folder, or s3://bucket/prefix
     "region": None,              # S3 region; default $AWS_REGION / $AWS_DEFAULT_REGION, else us-east-1
     "endpoint": None,            # an S3-compatible endpoint (MinIO...): path-style requests to it
@@ -126,6 +129,7 @@ def make_config(user: dict, path: str = "config") -> dict:
     if cfg["role"] not in ROLES:
         sys.exit(f"eaveswatch: role is one of {', '.join(ROLES)}, not {cfg['role']!r}")
     cfg["host"] = safe_name(cfg["host"] or socket.gethostname().split(".")[0])
+    cfg["system"] = safe_name(cfg["system"] or cfg["host"])
     cfg["env"] = safe_name(cfg["env"])
     cfg["state_dir"] = os.path.expanduser(cfg["state_dir"])
     cfg["ridge"]["data"] = os.path.expanduser(cfg["ridge"]["data"] or os.path.join(cfg["state_dir"], "ridge"))
@@ -2307,6 +2311,9 @@ def iam_policy(cfg: dict) -> dict:
     b, pre = u.netloc, (u.path.strip("/") + "/") if u.path.strip("/") else ""
     arn = f"arn:aws:s3:::{b}"
     stmts = [{"Sid": "WriteOwnHost", "Effect": "Allow", "Action": "s3:PutObject", "Resource": f"{arn}/{pre}*/host={cfg['host']}/*"}]
+    if cfg["role"] in ("finial", "eave"):           # its system's profile: saved by the loop, read by a new instance
+        stmts.append({"Sid": "SystemProfile", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+                      "Resource": f"{arn}/{pre}profiles/system={cfg['system']}/*"})
     if cfg["role"] == "eave":
         stmts += [{"Sid": "ListAsks", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
                    "Condition": {"StringLike": {"s3:prefix": f"{pre}env=*/kind=requests/*"}}},
@@ -2358,6 +2365,16 @@ wakes you with a **digest** when there's something to look at, and is silent
 (free) when there isn't.
 
 You have two jobs: **keep the interpreter right**, and **review**.
+
+## Restored from a profile
+
+If `{{data}}/restored.json` exists, this box was set up from its system's saved
+profile: the interpreter, alert rules and charter came from another instance of
+this system (an autoscaling group, say). Run `discover`, compare what this box runs
+and writes with what the interpreter expects, and fix what differs (paths,
+versions, units): that's narrowing and fixing, so it's yours. Tell your person
+in one note what you changed, or that it matched. Your changes save to the
+profile by themselves, for the next instance.
 
 ## Setting up (no interpreter applied yet)
 
@@ -2567,6 +2584,12 @@ def check_store(c: Check, cfg: dict, store, role: str) -> None:
                  f"allow s3:PutObject on {cfg['store']}/*/host={cfg['host']}/*")
     if ok:
         c.ok("store: write", probe)
+    if role in ("finial", "eave"):               # its system's profile: saved by the loop, read by a new instance
+        pk = profile_prefix(cfg["system"]) + ".check"
+        ok, _ = step("profile", lambda: store.put(pk, b"{}"),
+                     f"allow s3:GetObject and s3:PutObject on {cfg['store']}/profiles/system={cfg['system']}/*")
+        if ok:
+            c.ok("store: profile", f"profiles/system={cfg['system']}/ (saved by the loop when the setup changes)")
     if role == "finial":
         pass                                      # a finial only writes: its asks and its ridge are right here
     elif role == "eave":
@@ -2836,6 +2859,10 @@ def setup(argv: list[str]) -> None:
     ap.add_argument("--alert-email", help="where alerts and the reviewer's notes go (asked for if not given)")
     ap.add_argument("--smtp", help="send through this SMTP relay (host:port) instead of the box's sendmail")
     ap.add_argument("--publish-dir", help="a folder a web server already serves, for the findings page (asked for)")
+    ap.add_argument("--system", help="the name instances of this system share (an ASG's), for its saved profile; "
+                                     "default: the hostname")
+    ap.add_argument("--key-env", default="EAVESWATCH_MODEL_KEY",
+                    help="the environment variable a new instance will find the model key in (restore reads it)")
     ap.add_argument("--force", action="store_true", help="replace an existing config or unit")
     a = ap.parse_args(argv)
     cfg_path = os.path.expanduser(SETUP_CONFIG)
@@ -2863,7 +2890,8 @@ def setup(argv: list[str]) -> None:
         region = (bucket_region(urllib.parse.urlsplit(store).netloc) or imds_region() or os.environ.get("AWS_REGION")
                   or "us-east-1") if store.startswith("s3://") else None
         user = {"role": "finial", "env": a.env, "store": store, "state_dir": SETUP_STATE,
-                **({"region": region} if region else {}), **({"host": a.host} if a.host else {})}
+                **({"region": region} if region else {}), **({"host": a.host} if a.host else {}),
+                **({"system": a.system} if a.system else {})}
         if old and old != user and not a.force:
             sys.exit(f"eaveswatch: {cfg_path} already sets up {old.get('store')}; --force replaces it")
         write_json(cfg_path, user)
@@ -2917,33 +2945,182 @@ def setup(argv: list[str]) -> None:
         queue_note(cfg, "test note", "eaveswatch can reach you. Alerts and the reviewer's notes come this way.", "warn", "test")
         sent, _ = deliver_notes(cfg)
         print("  sent: check your inbox (and spam)" if sent else "  not sent: see the error above")
+    install_finial_unit(cfg_path, a.no_service, a.force)
+    # what a new instance of this system needs to start the same reviewer: never the key, only where it'll be
+    write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), {"url": a.url, "model": a.model, "key_env": a.key_env})
+    start_reviewer(hob, cfg, cfg_path, a.url, a.model, a.key, a.no_service, not a.no_chat,
+                   "starting the reviewer (hobkin): it looks at this box, then asks you what you care about")
+
+
+def install_finial_unit(cfg_path: str, no_service: bool, force: bool) -> None:
+    """The finial as a user service, started now and at boot (with linger, while nobody's logged in)."""
     cmd = eaveswatch_cmd()
-    if a.no_service:
+    if no_service:
         print(f"not installing services: run `{cmd} --config {cfg_path} finial` yourself")
+        return
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    unit = os.path.join(unit_dir, "eaveswatch-finial.service")
+    want = FINIAL_UNIT.format(cmd=cmd, config=cfg_path)
+    if os.path.exists(unit) and _read(unit) != want and not force:
+        print(f"leaving {unit} as it is (it differs; --force replaces it)")
     else:
-        unit_dir = os.path.expanduser("~/.config/systemd/user")
-        unit = os.path.join(unit_dir, "eaveswatch-finial.service")
-        want = FINIAL_UNIT.format(cmd=cmd, config=cfg_path)
-        if os.path.exists(unit) and _read(unit) != want and not a.force:
-            print(f"leaving {unit} as it is (it differs; --force replaces it)")
-        else:
-            os.makedirs(unit_dir, exist_ok=True)
-            with open(unit, "w") as f:
-                f.write(want)
-        for c in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", "eaveswatch-finial"]):
-            r = subprocess.run(c, capture_output=True, text=True)
-            if r.returncode:
-                sys.exit(f"eaveswatch: {' '.join(c)} failed: {r.stderr.strip()} (no user systemd here? try --no-service)")
-        print("started eaveswatch-finial (a user service: systemctl --user status eaveswatch-finial)")
+        os.makedirs(unit_dir, exist_ok=True)
+        with open(unit, "w") as f:
+            f.write(want)
+    for c in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", "eaveswatch-finial"]):
+        r = subprocess.run(c, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f"eaveswatch: {' '.join(c)} failed: {r.stderr.strip()} (no user systemd here? try --no-service)")
+    user = pwd.getpwuid(os.getuid()).pw_name
+    if "Linger=no" in run(["loginctl", "show-user", user, "-p", "Linger"]):
+        r = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        print("turned on linger: the services run with nobody logged in" if r.returncode == 0 else
+              f"note: couldn't turn on linger ({r.stderr.strip()}): an admin can, with `loginctl enable-linger {user}`")
+    print("started eaveswatch-finial (a user service: systemctl --user status eaveswatch-finial)")
+
+
+def start_reviewer(hob: list[str], cfg: dict, cfg_path: str, url: str, model: str, key: str | None, no_service: bool,
+                   chat: bool, say: str) -> None:
+    """The chore, then hobkin's own one-line setup with it (this process becomes hobkin)."""
     d = install_chore(None, True)
     print(f"the reviewer chore: {d}")
-    args = hob + [a.url, a.model] + ([a.key] if a.key else []) + [
+    args = hob + [url, model] + ([key] if key else []) + [
         "--chore", "eaveswatch", "--set", f"config={cfg_path}", "--set", f"data={cfg['ridge']['data']}",
-        "--set", f"command={cmd}", "--id", "eaveswatch", "--safe"] + (["--no-service"] if a.no_service else []) + \
-        ([] if a.no_chat else ["--chat"])
-    print("starting the reviewer (hobkin): it looks at this box, then asks you what you care about")
+        "--set", f"command={eaveswatch_cmd()}", "--id", "eaveswatch", "--safe"] + (["--no-service"] if no_service else []) + \
+        (["--chat"] if chat else [])
+    print(say)
     sys.stdout.flush()
     os.execvp(args[0], args)
+
+
+# ---- profiles: a system's setup in the store, so a new instance (an ASG's) sets itself up from it. What's
+# shared: the config (not the host), the interpreter (alert rules too), the charter, the reviewer's model API and
+# the NAME of the variable holding its key, and dismissed findings. Never secrets, never one machine's state.
+PROFILE_CONFIG_KEYS = ("role", "env", "store", "region", "endpoint", "every", "inventory_every", "discover_every",
+                       "spool_max_mb", "notify", "publish", "system")   # not folders: where a machine keeps its own state
+
+
+def profile_prefix(system: str) -> str:
+    return f"profiles/system={safe_name(system)}/"
+
+
+def build_profile(cfg: dict, cfg_path: str) -> dict:
+    user = read_json(cfg_path, {}) or {}
+    spec, v = active_spec(cfg)
+    data = cfg["ridge"]["data"]
+    charter = _read(os.path.join(data, "REVIEW.md")) or None
+    dismissed = [{k: f.get(k) for k in ("id", "category", "location", "claim")} | {"why": next(
+        (h.get("why") for h in reversed(f.get("history") or []) if h.get("why")), None)}
+        for f in findings(cfg).values() if f.get("status") == "dismissed"]
+    return {"eaveswatch": __version__, "system": cfg["system"],
+            "config": {k: user[k] for k in PROFILE_CONFIG_KEYS if k in user},
+            "interpreter": {"version": v, "spec": spec} if v else None, "charter": charter,
+            "reviewer": read_json(os.path.join(data, "reviewer.json"), None), "dismissed": dismissed}
+
+
+def save_profile(cfg: dict, cfg_path: str, store=None) -> str | None:
+    """Save the system's profile to the store if it changed since the last save (latest, and a copy in history).
+    Returns its key, or None if nothing changed."""
+    prof = build_profile(cfg, cfg_path)
+    h = hashlib.sha256(json.dumps(prof, sort_keys=True).encode()).hexdigest()
+    mark = os.path.join(cfg["ridge"]["data"], "profile.hash")
+    if _read(mark).strip() == h:
+        return None
+    store = store or open_store(cfg)
+    prof = {**prof, "saved": iso(now_utc()), "from_host": cfg["host"]}
+    body = json.dumps(prof, indent=1, sort_keys=True).encode()
+    pre = profile_prefix(cfg["system"])
+    store.put(f"{pre}history/profile_{stamp(now_utc())}_{secrets.token_hex(2)}.json", body)
+    store.put(f"{pre}profile.json", body)
+    os.makedirs(os.path.dirname(mark), exist_ok=True)
+    with open(mark, "w") as f:
+        f.write(h)
+    return f"{pre}profile.json"
+
+
+def restore(argv: list[str]) -> None:
+    """eaveswatch restore STORE SYSTEM: a new instance sets itself up from its system's saved profile, with no
+    questions (for an ASG's user-data). Secrets come from the environment: the model key from the variable the
+    profile names, AWS credentials from the instance profile."""
+    ap = argparse.ArgumentParser(prog="eaveswatch restore", description=restore.__doc__.split("\n")[0])
+    ap.add_argument("store", help="s3://bucket/prefix (or a folder) where the system's profile was saved")
+    ap.add_argument("system")
+    ap.add_argument("--host", help="this instance's name in the store (default: its hostname)")
+    ap.add_argument("--no-service", action="store_true")
+    ap.add_argument("--no-reviewer", action="store_true", help="set up the finial only, without starting the reviewer")
+    ap.add_argument("--force", action="store_true", help="replace an existing setup here")
+    a = ap.parse_args(argv)
+    cfg_path = os.path.expanduser(SETUP_CONFIG)
+    if os.path.exists(cfg_path) and not a.force:
+        sys.exit(f"eaveswatch: {cfg_path} exists: this box is set up already (--force replaces it)")
+    region = (bucket_region(urllib.parse.urlsplit(a.store).netloc) or imds_region() or os.environ.get("AWS_REGION")
+              or "us-east-1") if a.store.startswith("s3://") else None
+    store = S3Store(a.store, region) if a.store.startswith("s3://") else FolderStore(a.store)
+    key = profile_prefix(a.system) + "profile.json"
+    try:
+        prof = json.loads(store.get(key))
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        sys.exit(f"eaveswatch: no profile for {a.system!r} at {a.store}/{key} ({getattr(e, 'reason', e)}): "
+                 "set one instance up with `eaveswatch URL MODEL --system NAME` first; its loop saves the profile")
+    user = {**prof.get("config", {}), "system": a.system, **({"host": a.host} if a.host else {})}
+    user.setdefault("state_dir", SETUP_STATE)
+    if region and a.store.startswith("s3://"):
+        user["region"] = region
+    write_json(cfg_path, user)
+    cfg = load_config(cfg_path)
+    data = cfg["ridge"]["data"]
+    os.makedirs(data, exist_ok=True)
+    print(f"restored {a.system}'s profile (saved {prof.get('saved')} from {prof.get('from_host')}) into {cfg_path}")
+    if prof.get("interpreter"):
+        # validated, not replayed: the logs may not exist yet at boot; the reviewer checks it against this box
+        errs = validate_spec(prof["interpreter"]["spec"])
+        if errs:
+            sys.exit(f"eaveswatch: the saved interpreter doesn't validate here: {'; '.join(errs[:3])}")
+        d = interp_dir(cfg)
+        os.makedirs(d, exist_ok=True)
+        write_json(os.path.join(d, "v1.json"), prof["interpreter"]["spec"])
+        rec = {"version": 1, "applied": iso(now_utc()), "note": f"restored from {a.system}'s profile "
+               f"(v{prof['interpreter']['version']} on {prof.get('from_host')})", "from": None}
+        write_json(os.path.join(d, "active.json"), rec)
+        append_jsonl(os.path.join(d, "history.jsonl"), {"event": "restore", **rec})
+        print(f"  the interpreter: {len(prof['interpreter']['spec'].get('sources') or [])} sources, "
+              f"{len(prof['interpreter']['spec'].get('alerts') or [])} alert rules")
+    if prof.get("charter"):
+        with open(os.path.join(data, "REVIEW.md"), "w") as f:
+            f.write(prof["charter"])
+    for f in prof.get("dismissed") or []:              # dismissed stays dismissed on every instance
+        if f.get("id") and f["id"] not in findings(cfg):
+            t = iso(now_utc())
+            append_jsonl(ledger_path(cfg), {"event": "new", "id": f["id"], "at": t, "category": f.get("category"),
+                                            "location": f.get("location"), "claim": f.get("claim"), "restored": True})
+            append_jsonl(ledger_path(cfg), {"event": "status", "id": f["id"], "at": t, "status": "dismissed", "why": f.get("why")})
+    write_json(os.path.join(data, "restored.json"), {"system": a.system, "from_host": prof.get("from_host"),
+                                                     "saved": prof.get("saved"), "at": iso(now_utc())})
+    if prof.get("reviewer"):
+        write_json(os.path.join(data, "reviewer.json"), prof["reviewer"])
+    text, _ = run_check(cfg, cfg_path)
+    fatal = [l for l in text.splitlines() if l.startswith("  FAIL") and not l.startswith("  FAIL  source")
+             and not l.startswith("  FAIL  service")]          # sources and versions: the services may still be starting
+    if fatal:
+        print(text)
+        sys.exit("eaveswatch: fix what check says, then run this again (with --force)")
+    print("check: the store, credentials and alerts are good")
+    install_finial_unit(cfg_path, a.no_service, a.force)
+    rv = prof.get("reviewer")
+    if a.no_reviewer or cfg["role"] != "finial":
+        return
+    if not rv:
+        print("no reviewer in the profile: start one with `eaveswatch URL MODEL` (it reuses this setup)")
+        return
+    key = os.environ.get(rv.get("key_env") or "EAVESWATCH_MODEL_KEY")
+    if not key:
+        sys.exit(f"eaveswatch: the reviewer's model key isn't in ${rv.get('key_env') or 'EAVESWATCH_MODEL_KEY'}: set it "
+                 "(from your secret store) and run this again with --force, or --no-reviewer")
+    hob = hobkin_cmd()
+    if not hob:
+        sys.exit("eaveswatch: the reviewer runs on hobkin, which isn't installed (pipx install hobkin-eaveswatch brings it)")
+    start_reviewer(hob, cfg, cfg_path, rv["url"], rv["model"], key, a.no_service, False,
+                   "starting the reviewer (hobkin): it checks the restored setup against this box")
 
 
 # ---- command line
@@ -2996,6 +3173,7 @@ def cli(argv: list[str] | None = None) -> None:
     f.add_argument("--all", action="store_true")
     sub.add_parser("check")
     sub.add_parser("iam")
+    sub.add_parser("save", help="save this system's profile to the store now (the loop does it when it changes)")
     nt = sub.add_parser("notify")
     nt.add_argument("text", nargs="*")
     nt.add_argument("--subject")
@@ -3010,6 +3188,8 @@ def cli(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv and (re.match(r"https?://", argv[0]) or argv[0] == "setup"):    # eaveswatch URL MODEL [KEY]: the one-line setup
         return setup(argv[1:] if argv[0] == "setup" else argv)
+    if argv and argv[0] == "restore":                  # a new instance, from its system's saved profile
+        return restore(argv[1:])
     args = ap.parse_args(argv)
     if args.cmd == "chore":                   # needs no config
         try:
@@ -3026,7 +3206,13 @@ def cli(argv: list[str] | None = None) -> None:
         text, problems = run_check(cfg, args.config)
         print(text)
         sys.exit(1 if problems else 0)
+    if args.cmd == "save":
+        k = save_profile(cfg, os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json"))
+        print(f"saved {cfg['system']}'s profile: {k}" if k else "unchanged since the last save")
+        return
     if args.cmd == "iam":
+        if not cfg["store"].startswith("s3://"):
+            sys.exit(f"eaveswatch: the store is a folder ({cfg['store']}): no IAM policy needed")
         print(json.dumps(iam_policy(cfg), indent=2))
         return
     if args.cmd == "notify":
@@ -3062,15 +3248,23 @@ def cli(argv: list[str] | None = None) -> None:
         rd = Ridge(cfg)
         e = Eave(cfg, inbox=rd.p("inbox"))
         last = {"discover": 0.0}
+        cfg_file = os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json")
 
         def finial_tick():
             e.tick()
             sent, left = e.last_flush
             notes, _ = deliver_notes(cfg)
             published = publish_report(cfg)
+            try:                                       # the system's profile, for its next instance
+                saved = save_profile(cfg, cfg_file, e.store)
+            except (OSError, urllib.error.URLError, ValueError) as err:
+                saved = None
+                print(f"eaveswatch: saving the profile: {err}", file=sys.stderr, flush=True)
             msg = [f"notes sent: {notes}"] if notes and args.once else []
             if published and args.once:
                 msg.append(f"findings page: {published}/index.html")
+            if saved and args.once:
+                msg.append(f"profile saved: {saved}")
             if time.time() - last["discover"] >= cfg["discover_every"]:
                 _, ch = run_discovery(cfg)
                 last["discover"] = time.time()
