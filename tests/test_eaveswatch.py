@@ -755,11 +755,13 @@ check("[alerts] in a fleet, the ridge queues an eave's alert as it syncs it", le
 sh2 = tempfile.mkdtemp(prefix="eaveswatch-setup3-")
 os.makedirs(os.path.join(sh2, "www"))
 o5 = subprocess.run([sys.executable, EW, "https://api.example.test/v1", "m", "--store", os.path.join(sh2, "store"), "--no-service",
-                     "--alert-email", "me@example.test", "--publish-dir", os.path.join(sh2, "www")], capture_output=True, text=True,
+                     "--alert-email", "me@example.test", "--smtp", f"127.0.0.1:{smtp.server_address[1]}",   # no sendmail on CI
+                     "--publish-dir", os.path.join(sh2, "www")], capture_output=True, text=True,
                     stdin=subprocess.DEVNULL, env={**senv, "HOME": sh2})
 c5 = json.load(open(os.path.join(sh2, ".config", "eaveswatch", "finial.json"))) if o5.returncode == 0 else {}
 check("[setup] where alerts go and the web folder for the findings page, from flags (asked for at a terminal)",
-      c5.get("notify", {}).get("email") == "me@example.test" and c5.get("publish", {}).get("dir") == os.path.join(sh2, "www")
+      c5.get("notify", {}).get("email") == "me@example.test" and c5.get("notify", {}).get("smtp", "").startswith("127.0.0.1:")
+      and c5.get("publish", {}).get("dir") == os.path.join(sh2, "www")
       and "anyone who can reach that site sees the findings" in o5.stdout, o5.stdout + o5.stderr)
 
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
