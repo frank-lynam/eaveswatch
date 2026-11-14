@@ -255,5 +255,15 @@ out = subprocess.run([sys.executable, os.path.join(HERE, "..", "eaveswatch.py"),
                      capture_output=True, text=True)
 check("[cli] ridge watch with nothing new prints nothing (a quiet wake)", out.returncode == 0 and out.stdout == "", out.stdout + out.stderr)
 
+chores = tempfile.mkdtemp(prefix="eaveswatch-chores-")
+out = subprocess.run([sys.executable, os.path.join(HERE, "..", "eaveswatch.py"), "chore", chores], capture_output=True, text=True)
+cj = json.load(open(os.path.join(chores, "eaveswatch", "chore.json"))) if out.returncode == 0 else {}
+check("[chore] eaveswatch chore writes the reviewer chore (no config needed): a quiet watch, safe mode writing only data",
+      cj.get("name") == "eaveswatch" and cj["config"]["wake"]["command"] == "eaveswatch --config {{config}} ridge watch"
+      and cj["config"]["safe_mode"] == {"write": ["{{data}}"]}
+      and "## The bar for a finding" in open(os.path.join(chores, "eaveswatch", "CHORE.md")).read(), out.stdout + out.stderr)
+again = subprocess.run([sys.executable, os.path.join(HERE, "..", "eaveswatch.py"), "chore", chores], capture_output=True, text=True)
+check("[chore] an installed chore isn't replaced without --force", again.returncode != 0 and "--force" in again.stderr, again.stderr)
+
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
 sys.exit(1 if FAILED else 0)

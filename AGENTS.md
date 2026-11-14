@@ -15,7 +15,8 @@
   a fixed menu (`lines`, `inventory`, `flows`): never add one that runs a command it's given.
 - **Quiet is free:** `ridge watch` prints nothing when there's nothing new, so a hobkin's wake costs no model
   call. Don't make it chatty.
-- **The reviewer's instructions** are `chore/eaveswatch/` (a hobkin chore: `chore.json`, `CHORE.md`).
+- **The reviewer's instructions** are a hobkin chore kept inside the file (`CHORE_JSON`, `CHORE_MD`), so a
+  pip install carries it; `eaveswatch chore` writes it out where hobkin finds chores by name.
 - **No auto-updates or migrations:** no code that detects an older state file or layout and rewrites it.
 - **Tests:** `python3 tests/test_eaveswatch.py` (folder store and a fake S3; no AWS). Add a check for what you
   change; run what you changed, CI runs the rest.

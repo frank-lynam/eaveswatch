@@ -38,5 +38,5 @@ eaveswatch = "eaveswatch:cli"
 name = "eaveswatch"
 
 [tool.flit.sdist]
-include = ["tests/", "chore/", "examples/"]
+include = ["tests/", "examples/"]
 exclude = ["CLAUDE.md", "AGENTS.md"]

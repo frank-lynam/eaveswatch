@@ -80,9 +80,9 @@ On the ridge, two pieces, deliberately apart:
    commands (safe mode). It only reads the data folder:
 
    ```sh
-   hobkin --chore /path/to/hobkin-eaveswatch/chore/eaveswatch \
-     --set config=/etc/eaveswatch.json --set data=/srv/eaveswatch-ridge \
-     --set repos="/srv/code" --id eaveswatch --safe
+   eaveswatch chore                      # writes the chore to ~/.hobkins/_shared/chores/eaveswatch
+   hobkin --chore eaveswatch --set config=/etc/eaveswatch.json \
+     --set data=/srv/eaveswatch-ridge --set repos="/srv/code" --id eaveswatch --safe
    ```
 
    Start the sync loop first: it creates the data folder, and safe mode
@@ -100,7 +100,7 @@ On the ridge, two pieces, deliberately apart:
 
 ## What the reviewer does
 
-The chore ([chore/eaveswatch/CHORE.md](chore/eaveswatch/CHORE.md)) has the full instructions. In short:
+The chore's instructions (`CHORE_MD` in `eaveswatch.py`; `eaveswatch chore` writes them out) say it all. In short:
 
 - **The map** (`DATA/map/`) builds itself from eave reports: `hosts.json`
   (what runs where, at which version, last seen), `edges.json` (listeners,
