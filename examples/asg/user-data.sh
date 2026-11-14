@@ -1,17 +1,16 @@
 #!/bin/bash
-# EC2 user-data for an autoscaling group: runs as root at first boot. The image already has the PeopleSoft (or
-# other) services as user units of PSUSER. One instance was set up by hand first, with
-#   eaveswatch URL MODEL --system ps-hr-app
-# which shares the system's config; everything else the system knows is in the bucket.
+# EC2 user-data: every instance of the system runs this at boot, the first one included (it creates the system;
+# the rest join it). Runs as root; the image already has the services as user units of PSUSER, and Python 3.9+.
+# Feed the flags from your own variables or secret store: eaveswatch takes them as given.
 set -euo pipefail
 PSUSER=psadm2
-SYSTEM=ps-hr-app
-STORE=s3://my-eaves-bucket/eaveswatch
-# The reviewer's model key: from your secret store, into the environment only (the instance role reads it)
-KEY=$(aws secretsmanager get-secret-value --secret-id eaveswatch/model-key --query SecretString --output text)
+MODEL_KEY=$(aws secretsmanager get-secret-value --secret-id my/model-key --query SecretString --output text)
 
 loginctl enable-linger "$PSUSER"                     # user units run with nobody logged in
 uid=$(id -u "$PSUSER")
 until [ -S "/run/user/$uid/bus" ]; do sleep 1; done  # the user's systemd is up
-sudo -u "$PSUSER" -i env XDG_RUNTIME_DIR="/run/user/$uid" EAVESWATCH_MODEL_KEY="$KEY" \
-  bash -lc "pipx install 'eaveswatch[hobkin]' && eaveswatch join $STORE $SYSTEM"
+sudo -u "$PSUSER" -i env XDG_RUNTIME_DIR="/run/user/$uid" MODEL_KEY="$MODEL_KEY" bash -lc '
+  pipx install "eaveswatch[hobkin]"
+  eaveswatch boot --store s3://my-eaves-bucket/eaveswatch --system ps-hr-app \
+    --model-url https://api.example.gov/v1 --model my-model --model-key "$MODEL_KEY" \
+    --alert-email ops@example.gov --publish-dir /var/www/html/eaveswatch'

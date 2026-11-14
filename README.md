@@ -103,14 +103,6 @@ Discovery runs again every hour. What changed (new units, programs,
 listeners, logs written but not collected) comes in its digest. It fixes and
 narrows the interpreter on its own, and asks you before adding a source.
 
-IAM for a node: write its own host's data and asks, read, write and delete its
-system's shared state (`PREFIX/systems/system=NAME/*`), and read its
-environment's data, because any node may hold the ridge duty. `eaveswatch iam`
-prints that exact policy for this box. Within one system's nodes that's one
-trust boundary; separate systems stay apart. If the credentials can
-do far more (an instance profile with full S3 access, say), `check` says so,
-and the reviewer raises it at setup.
-
 ## A system of several nodes (an autoscaling group)
 
 Every instance runs the same thing. There's no hub to deploy, and any node can
@@ -119,7 +111,7 @@ system knows lives in the store:
 
 ```
 PREFIX/systems/system=ps-hr-app/
-  config.json          the shared config and the reviewer's model API (its key's variable name, never the key)
+  config.json          the shared config and the reviewer's model API (never its key)
   interpreter/vN.json  every version: a node creates vN only if no other node has (the loser is told)
   charter.md           the reviewer's REVIEW.md
   ledger/              findings events, one object each, never overwritten: every node folds the same events
@@ -159,22 +151,34 @@ PREFIX/systems/system=ps-hr-app/
 - **A clean stop** (scale-in, shutdown) marks the node as left, gives the lease
   and its job back, and isn't reported as gone.
 
-Set the first node up with `eaveswatch URL MODEL --system ps-hr-app`. It shares
-the system's config. Every later instance joins from its user-data, with no
-questions ([examples/asg/user-data.sh](examples/asg/user-data.sh)):
+**Every node boots the same way**, with no questions, from the same line in
+your launch template ([examples/asg/user-data.sh](examples/asg/user-data.sh)).
+Everything comes in by flag, so feed them from whatever variables or secret
+store you already use:
 
 ```sh
-eaveswatch join s3://my-eaves-bucket/eaveswatch ps-hr-app
+eaveswatch boot --store s3://my-eaves-bucket/eaveswatch --system ps-hr-app \
+  --model-url "$YOUR_MODEL_URL" --model "$YOUR_MODEL" --model-key "$YOUR_MODEL_KEY" \
+  --alert-email ops@example.gov --publish-dir /var/www/html/eaveswatch
 ```
 
-It writes this instance's config (its own host), and on its first tick pulls
-the interpreter, alert rules, charter and findings. It runs `check`, starts the
-user service, and starts the reviewer with its key from `$EAVESWATCH_MODEL_KEY`
-(or the variable the system names) and no chat. `--no-reviewer` makes a
-collector-only node, which shares data but never leads or reviews. The hobkin
-adapter keeps the key it's given in hobkin's own key file, readable only by
-that user. AWS
-credentials come from the instance profile.
+- **The system is there already:** the node joins it. It writes its own config
+  (its own host), and on its first tick pulls the interpreter, alert rules,
+  charter and findings.
+- **It isn't:** the node creates it from the flags and shares its config (the
+  model API, alerts, publish folder; never the key). Its reviewer then runs
+  the setup conversation once, by `notify` as well as chat since nobody's
+  attached at boot. You answer by chatting with it (`hobkin chat eaveswatch`).
+- **Either way** it runs `check` (sources that aren't there yet don't stop
+  it: the services may still be starting), installs and starts the user
+  service, and starts the reviewer with the key you gave and no chat. Running
+  it again is safe.
+- `--collector` makes a collector-only node, which shares data but never leads
+  or reviews. `--reviewer none` brings your own agent harness. The hobkin
+  adapter keeps the key in hobkin's own key file, readable only by that user.
+
+AWS access is the instance's own: eaveswatch uses whatever credentials the box
+has (instance profile, environment, `~/.aws`) and only needs the bucket name.
 
 `cluster` in the config tunes the timings: `lease_seconds` (180),
 `claim_seconds` (600), `job_wait_seconds` (120), `node_gone_seconds` (300),
@@ -247,8 +251,8 @@ query the archive as it is:
 PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=ps-hr-01/ps-hr-01_20261114T091502Z_7f3a.jsonl.gz
 ```
 
-- **Time before host:** the ridge lists one hour across every host, and IAM
-  can still hold each host to its own prefix (`*/host=web-3/*`).
+- **Time before host:** the ridge lists one hour across every host, and each
+  host's files are still under its own prefix (`*/host=web-3/*`).
 - **The name stands alone:** host, UTC stamp (sorts as text), a random suffix.
 - **Kinds:**
   - `packets`: templates, counts, samples, new and spiking
@@ -275,8 +279,7 @@ Every host runs an eave ([examples/fleet/](examples/fleet/)): plumbing-only
 config, with its interpreter in `STATE_DIR/interpreter`. The hub runs the ridge
 sync loop with the store's credentials, and the reviewer agent has none:
 `ridge watch` and every command it runs read and write only the ridge's data
-folder. IAM: [examples/iam/eave.json](examples/iam/eave.json) and
-[examples/iam/ridge.json](examples/iam/ridge.json). The ridge never gets
+folder. The ridge never gets
 `kind=raw`.
 
 ## The reviewer contract
@@ -300,7 +303,7 @@ files, so any harness that does these four things can be the reviewer:
 **hobkin** is built in as the adapter (`pip install 'eaveswatch[hobkin]'`).
 `eaveswatch reviewer install hobkin` writes the instructions as a hobkin chore:
 its wake, safe mode writing only the data folder, and its alert command into
-`notify`. Setup and `join` start it. Another harness gets an adapter class
+`notify`. `setup` and `boot` start it. Another harness gets an adapter class
 beside `HobkinReviewer` (in `REVIEWERS`), or just uses the contract.
 
 ## What the reviewer does

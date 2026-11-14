@@ -756,7 +756,7 @@ ctext, cprob = ew.run_check(scfg2, "x.json")
 check("[check] the alert channel is checked (the relay answers; nothing is sent)", "ok    alerts: to me@example.test by SMTP" in ctext
       and len(got_mail) == 1, ctext)
 
-# the commands: notify (from hobkin's alert_command too), notify --test, iam
+# the commands: notify (from hobkin's alert_command too), notify --test
 acfg_path = os.path.join(ab, "acfg.json")
 json.dump({"store": acfg["store"], "env": "test", "host": "ps1", "role": "finial", "state_dir": acfg["state_dir"],
            "notify": {"email": "me@example.test", "sendmail": fake_sendmail, "per_hour": 50}}, open(acfg_path, "w"))
@@ -767,22 +767,6 @@ check("[notify] a harness's own trouble (hobkin's alert_command, as the adapter 
                                                            for n in q()), on.stdout + on.stderr)
 ot = cli("--config", acfg_path, "notify", "--test")
 check("[notify] --test sends one now", ot.returncode == 0 and "sent" in ot.stdout and "test note" in open(mailbox).read(), ot.stdout + ot.stderr)
-iam_path = os.path.join(ab, "iam.json")
-json.dump({"store": "s3://my-bucket/eaveswatch", "env": "prod", "host": "ps1", "system": "ps-hr", "role": "finial",
-           "state_dir": os.path.join(ab, "iam")}, open(iam_path, "w"))
-oi = cli("--config", iam_path, "iam")
-pol = json.loads(oi.stdout) if oi.returncode == 0 else {}
-sids = {st["Sid"]: st for st in pol.get("Statement", [])}
-check("[iam] a node: write its own host's data, the system's shared state, and read its environment's data (any node may hold the ridge)",
-      set(sids) == {"WriteOwnHost", "SystemState", "List", "ReadAsksAndAnswers", "RidgeDutyReads"}
-      and "arn:aws:s3:::my-bucket/eaveswatch/*/host=ps1/*" in sids["WriteOwnHost"]["Resource"]
-      and sids["SystemState"]["Resource"] == "arn:aws:s3:::my-bucket/eaveswatch/systems/system=ps-hr/*"
-      and "s3:DeleteObject" in sids["SystemState"]["Action"], oi.stdout)
-check("[iam] a folder store needs no policy, and says so", "no IAM policy needed" in cli("--config", acfg_path, "iam").stderr)
-s3f = ew.make_config({"store": "s3://bucket/eaves/v1", "env": "test", "host": "ps9", "role": "finial", "state_dir": tempfile.mkdtemp()})
-btext, _ = ew.run_check(s3f, "x", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
-check("[check] credentials that can list every bucket are noticed, and `iam` named", "warn  credentials: they can list every bucket (2)" in btext
-      and "eaveswatch iam" in btext, btext)
 # a fleet: the ridge's sync sends alerts from the store on to the person
 fl_store = os.path.join(ab, "fleet-store")
 fe_cfg = ew.make_config({"store": fl_store, "env": "test", "host": "web-1", "state_dir": os.path.join(ab, "fe")})
@@ -930,29 +914,47 @@ n2.tick(); n3.tick(); n2.tick()
 w2 = ew.node_watch(c2)
 check("[cluster] an ask to another node is answered through the store, back to the reviewer who asked",
       "an answer from n3" in w2 and '"inventory"' in w2, w2[:300])
-# a new instance joins: no questions, the rest on its first tick
-ew.write_json(os.path.join(c1["ridge"]["data"], "reviewer.json"), {"adapter": "hobkin", "url": "https://api.example.test/v1", "model": "m",
-                                                                   "key_env": "EAVESWATCH_MODEL_KEY"})
+# boot: every node, every boot, all by flag: joins the system, or creates it
+ew.write_json(os.path.join(c1["ridge"]["data"], "reviewer.json"), {"adapter": "hobkin", "url": "https://api.example.test/v1", "model": "m"})
 ew.share_config(c1, c1p)
-jb = tempfile.mkdtemp(prefix="eaveswatch-join-")
+jb = tempfile.mkdtemp(prefix="eaveswatch-boot-")
 open(os.path.join(jb, "fake_hobkin.py"), "w").write("import json,sys; json.dump(sys.argv[1:], open(sys.argv[0] + '.out', 'w'))")
-jenv = {**os.environ, "HOME": jb, "HOBKIN_HOME": os.path.join(jb, ".hobkins"), "EAVESWATCH_MODEL_KEY": "sk-from-env",
+jenv = {**os.environ, "HOME": jb, "HOBKIN_HOME": os.path.join(jb, ".hobkins"),
         "EAVESWATCH_HOBKIN": f"{sys.executable} {os.path.join(jb, 'fake_hobkin.py')}"}
-jr = subprocess.run([sys.executable, EW, "join", cstore, "ps", "--no-service", "--host", "n4"], capture_output=True, text=True,
-                    env=jenv, stdin=subprocess.DEVNULL)
+boot = lambda home, *a: subprocess.run([sys.executable, EW, "boot", *a], capture_output=True, text=True,
+                                       env={**jenv, "HOME": home}, stdin=subprocess.DEVNULL)
+jr = boot(jb, "--store", cstore, "--system", "ps", "--model-key", "sk-from-my-own-variable", "--host", "n4", "--no-service")
 real_home, os.environ["HOME"] = os.environ.get("HOME"), jb
 c4 = ew.load_config(os.path.join(jb, ".config", "eaveswatch", "finial.json")) if jr.returncode == 0 else None
 os.environ["HOME"] = real_home
 hargs = json.load(open(os.path.join(jb, "fake_hobkin.py.out"))) if os.path.exists(os.path.join(jb, "fake_hobkin.py.out")) else []
-check("[join] a new instance joins with no questions: its own host, the system's interpreter, charter and findings on its first tick",
-      c4 and c4["host"] == "n4" and c4["system"] == "ps" and ew.active_spec(c4)[0].get("about") == "from n2"
-      and "Sign-on failures" in ew._read(os.path.join(c4["ridge"]["data"], "REVIEW.md")) and cfid in ew.findings(c4),
-      jr.stdout + jr.stderr)
-check("[join] its reviewer starts with the key from the environment, and no chat (nobody's there)",
-      hargs[:3] == ["https://api.example.test/v1", "m", "sk-from-env"] and "--chat" not in hargs and "--no-service" in hargs, hargs)
-jr2 = subprocess.run([sys.executable, EW, "join", cstore, "nope", "--no-service"], capture_output=True, text=True,
-                     env={**jenv, "HOME": tempfile.mkdtemp()}, stdin=subprocess.DEVNULL)
-check("[join] no such system: it says how one starts", jr2.returncode != 0 and "--system nope" in jr2.stderr, jr2.stderr)
+check("[boot] a node of an existing system: joins with no questions, its own host, the system's interpreter, charter, findings",
+      c4 and "joined system ps" in jr.stdout and c4["host"] == "n4" and c4["system"] == "ps"
+      and ew.active_spec(c4)[0].get("about") == "from n2" and cfid in ew.findings(c4)
+      and "Sign-on failures" in ew._read(os.path.join(c4["ridge"]["data"], "REVIEW.md")), jr.stdout + jr.stderr)
+check("[boot] the reviewer starts with the system's model API and the key given by flag, no chat (nobody's there)",
+      hargs[:3] == ["https://api.example.test/v1", "m", "sk-from-my-own-variable"] and "--chat" not in hargs, hargs)
+shared_before = ew.FolderStore(cstore).get("systems/system=ps/config.json")
+jr_again = boot(jb, "--store", cstore, "--system", "ps", "--model-key", "sk-from-my-own-variable", "--host", "n4", "--no-service")
+check("[boot] again (the next boot): the same setup, the shared config left alone",
+      jr_again.returncode == 0 and ew.FolderStore(cstore).get("systems/system=ps/config.json") == shared_before, jr_again.stderr)
+jr_nokey = boot(tempfile.mkdtemp(), "--store", cstore, "--system", "ps", "--no-service")
+check("[boot] a reviewer without its key: it says which flag", jr_nokey.returncode != 0 and "--model-key" in jr_nokey.stderr, jr_nokey.stderr)
+newstore = os.path.join(cb, "new-store")
+nb_home = tempfile.mkdtemp()
+jr_new = boot(nb_home, "--store", newstore, "--system", "fresh", "--model-url", "https://api.example.test/v1", "--model", "m2",
+              "--model-key", "sk-never-shared-9f3", "--alert-email", "ops@example.test", "--smtp", f"127.0.0.1:{smtp.server_address[1]}",
+              "--publish-dir", nb_home, "--no-service")
+fresh = ew.jget(ew.FolderStore(newstore), "systems/system=fresh/config.json")[0] or {}
+check("[boot] no such system yet: created from the flags (model API, alerts, findings page) and shared, never the key",
+      "created system fresh" in jr_new.stdout and fresh.get("reviewer", {}).get("model") == "m2"
+      and fresh["config"]["notify"]["email"] == "ops@example.test" and fresh["config"]["publish"]["dir"] == nb_home
+      and "sk-never-shared-9f3" not in json.dumps(fresh)
+      and not any("sk-never-shared-9f3" in ew.FolderStore(newstore).get(k).decode(errors="replace")
+                  for k in ew.FolderStore(newstore).list("")), jr_new.stdout + jr_new.stderr)
+col = boot(tempfile.mkdtemp(), "--store", newstore, "--system", "fresh", "--collector", "--no-service")
+check("[boot] --collector: collects and shares, never leads or reviews, and doesn't rewrite the system's config",
+      col.returncode == 0 and ew.jget(ew.FolderStore(newstore), "systems/system=fresh/config.json")[0] == fresh, col.stdout + col.stderr)
 # the same lease and claims against S3's conditional writes (the fake checks If-None-Match and If-Match)
 s3a, _ = node_cfg("s3a", "s3://bucket/eaves/v1")
 s3b, _ = node_cfg("s3b", "s3://bucket/eaves/v1")

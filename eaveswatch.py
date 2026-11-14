@@ -3,7 +3,8 @@
 for hobkin; any harness that meets `eaveswatch reviewer contract` can be the reviewer).
 
     eaveswatch URL MODEL [KEY]        set this box up as a finial and start its reviewer, in one go (asks for a bucket)
-    eaveswatch join STORE SYSTEM      a new instance (an ASG's) joins its system: no questions, secrets from env
+    eaveswatch boot --store S --system N [--model-url U --model M --model-key K ...]   every boot, every node, no
+                                      questions: join the system, or create it (all by flag: feed them your variables)
     eaveswatch watch                  for the reviewer's wake: the review this node claimed, or nothing
     eaveswatch job done|release ID    the reviewer finished, or gives a review back; job list: the system's
     eaveswatch eave   [--once]        on a host: its interpreter's sources -> templates and counts; inventory, flows;
@@ -19,7 +20,6 @@ for hobkin; any harness that meets `eaveswatch reviewer contract` can be the rev
     eaveswatch finding list [--all]             open findings (--all: every one)
     eaveswatch finding status ID STATUS [--why TEXT]    accepted, fixed, dismissed (with why), reopened
     eaveswatch notify TEXT [--severity page]    a note for the person (queued; the loop sends it): --test sends one now
-    eaveswatch iam                              the least S3 access this role needs, as an IAM policy
     eaveswatch check                            is this set up right? store, credentials, clock, interpreter, sources
     eaveswatch reviewer contract|instructions   what an agent harness needs to be the reviewer
     eaveswatch reviewer install hobkin          the hobkin adapter: its chore, where hobkin finds chores by name
@@ -47,15 +47,15 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #                flows, the spool, answering asks
 #   ridge        sync (store -> data folder, asks -> store), the map, the digest (watch)
 #   findings     the ledger: add, seen again, status, list
-#   notify       the queue for people (alerts, the reviewer's notes), sendmail/SMTP delivery; the findings page; IAM
+#   notify       the queue for people (alerts, the reviewer's notes), sendmail/SMTP delivery; the findings page
 #   the reviewer the contract and instructions for any agent harness; the hobkin adapter (its chore, its setup)
 #   check        `eaveswatch check`: each role's permissions, the interpreter, sources, versions, clock, a preview
 #   setup        `eaveswatch URL MODEL [KEY]`: a finial in one command, then hobkin's own setup with the chore
-#   cluster      a system's nodes: shared state in the store, the ridge lease, review jobs, join, the node's watch
+#   cluster      a system's nodes: shared state in the store, the ridge lease, review jobs, boot, the node's watch
 #   command line
 from __future__ import annotations
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 import argparse
 import configparser
@@ -2405,34 +2405,6 @@ def publish_report(cfg: dict) -> str | None:
     return targets[-1]
 
 
-def iam_policy(cfg: dict) -> dict:
-    """The least this role needs from S3, as an IAM policy. A node of a system also reads and writes the system's
-    shared state, and (a finial: any one may hold the ridge duty) reads its environment's data."""
-    u = urllib.parse.urlsplit(cfg["store"])
-    b, pre = u.netloc, (u.path.strip("/") + "/") if u.path.strip("/") else ""
-    arn, env, system = f"arn:aws:s3:::{b}", cfg["env"], cfg["system"]
-    if cfg["role"] == "ridge":
-        kinds = [f"{pre}env=*/kind={k}/*" for k in RIDGE_READS]
-        stmts = [{"Sid": "ListWhatItSyncs", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
-                  "Condition": {"StringLike": {"s3:prefix": kinds}}},
-                 {"Sid": "ReadWhatItSyncs", "Effect": "Allow", "Action": "s3:GetObject", "Resource": [f"{arn}/{k}" for k in kinds]},
-                 {"Sid": "SendAsksAndProbes", "Effect": "Allow", "Action": "s3:PutObject",
-                  "Resource": [f"{arn}/{pre}env=*/kind=requests/*", f"{arn}/{pre}env=*/kind=check/*"]}]
-        return {"Version": "2012-10-17", "Statement": stmts}
-    stmts = [{"Sid": "WriteOwnHost", "Effect": "Allow", "Action": "s3:PutObject",
-              "Resource": [f"{arn}/{pre}*/host={cfg['host']}/*", f"{arn}/{pre}env={env}/kind=requests/*"]},
-             {"Sid": "SystemState", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-              "Resource": f"{arn}/{pre}systems/system={system}/*"},
-             {"Sid": "List", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
-              "Condition": {"StringLike": {"s3:prefix": [f"{pre}systems/system={system}/*", f"{pre}env={env}/*"]}}},
-             {"Sid": "ReadAsksAndAnswers", "Effect": "Allow", "Action": "s3:GetObject",
-              "Resource": [f"{arn}/{pre}env={env}/kind=requests/*", f"{arn}/{pre}env={env}/kind=answers/*"]}]
-    if cfg["role"] == "finial":                       # the ridge duty can come to any finial: it reads the others' data
-        stmts.append({"Sid": "RidgeDutyReads", "Effect": "Allow", "Action": "s3:GetObject",
-                      "Resource": [f"{arn}/{pre}env={env}/kind={k}/*" for k in ("packets", "inventory", "flows", "alerts")]})
-    return {"Version": "2012-10-17", "Statement": stmts}
-
-
 # ---- the reviewer: what any agent harness needs to be eaveswatch's reviewer (the contract, the instructions), and
 # the adapter for hobkin, the harness eaveswatch is designed for (`pip install eaveswatch[hobkin]`). The core never
 # imports an agent: it speaks through commands and files, and only the adapters know a harness's vocabulary.
@@ -2468,7 +2440,7 @@ review what's routed to you, not everything.
   reach every node within a minute. Another node may have just applied an
   interpreter too: if yours lost the race, you'll be told; compare and redo it
   if it's still needed.
-- If `{{data}}/joined.json` exists, this node joined an existing system: the
+- If `{{data}}/joined.json` exists, this node booted into an existing system: the
   interpreter came from the others. Run `discover` and check it fits this box;
   fix what differs, and say so.
 
@@ -2480,7 +2452,9 @@ review what's routed to you, not everything.
    talk to), the files they have open for writing, other recently written logs
    near them with redacted samples, the config files they point at, and who writes
    to the journal. Read all of it. Work out what this system *is*.
-2. **Ask your human, once, in one message.** This is the one time you wait for an
+2. **Ask your human, once, in one message.** (Started at boot, with nobody in a
+   chat? Send the same message with `notify` too, saying how to answer you: by
+   chat with you on this box. Then wait.) This is the one time you wait for an
    answer before doing the work, because what gets collected leaves this box (for
    the store) and that's theirs to decide. Say what you found in a few lines
    ("a PeopleSoft app server domain HRDEV: PSAPPSRV x3, JOLT on 9000; a PIA
@@ -2491,9 +2465,7 @@ review what's routed to you, not everything.
    page: a unit failing, an error storm, sign-on failures from one place) versus
    what can wait for your write-up. Ask what *they* care about (sign-ons and
    lockouts, errors, integration failures, slow requests, config drift...). Give
-   your recommendation for each, so "yes" is a complete answer. If `check` said
-   the credentials can do far more than this needs, say so here too, with what
-   `{{command}} --config {{config}} iam` prints: the one policy it does need.
+   your recommendation for each, so "yes" is a complete answer.
 3. **Write the spec.** `{{command}} --config {{config}} interpret init {{data}}/interpreter/draft.json`
    gives you the starting point (generic placeholders and levels). Add:
    - `sources`: `{"name", "path": GLOB}` or `{"name", "journald": {"user": true,
@@ -2808,11 +2780,6 @@ def check_store(c: Check, cfg: dict, store, role: str) -> None:
                         c.ok(f"store: {env}/{kind}", f"{len(keys)} files this hour, read the newest")
                 else:
                     c.info(f"store: {env}/{kind}", "listed; nothing this hour yet (is an eave running?)")
-    if isinstance(store, S3Store) and role in ("eave", "finial"):
-        seen = list_buckets(store.region, store.endpoint)
-        if seen:
-            c.warn("credentials", f"they can list every bucket ({len(seen)}): far more than a {role} needs. "
-                   f"`eaveswatch iam` prints the one policy it does need; give the instance that instead")
     if isinstance(store, S3Store) and store.last_date:
         try:
             skew = (now_utc() - dt.datetime.strptime(store.last_date, "%a, %d %b %Y %H:%M:%S GMT")
@@ -3047,8 +3014,6 @@ def setup(argv: list[str]) -> None:
     ap.add_argument("--publish-dir", help="a folder a web server already serves, for the findings page (asked for)")
     ap.add_argument("--system", help="the name instances of this system share (an ASG's), for its saved profile; "
                                      "default: the hostname")
-    ap.add_argument("--key-env", default="EAVESWATCH_MODEL_KEY",
-                    help="the environment variable a new instance will find the model key in (restore reads it)")
     ap.add_argument("--force", action="store_true", help="replace an existing config or unit")
     a = ap.parse_args(argv)
     cfg_path = os.path.expanduser(SETUP_CONFIG)
@@ -3136,10 +3101,11 @@ def setup(argv: list[str]) -> None:
     install_finial_unit(cfg_path, a.no_service, a.force)
     # what a new instance of this system needs to start the same reviewer: never the key, only where it'll be
     write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"),
-               {"adapter": a.reviewer, "url": a.url, "model": a.model, "key_env": a.key_env} if a.reviewer != "none"
+               {"adapter": a.reviewer, "url": a.url, "model": a.model} if a.reviewer != "none"
                else {"adapter": "none"})
     try:                                             # what the system's next node joins with
-        print(f"shared the system's config: {share_config(cfg, cfg_path)} (new nodes: eaveswatch join STORE {cfg['system']})")
+        print(f"shared the system's config: {share_config(cfg, cfg_path)} (new nodes: eaveswatch boot --store "
+              f"{cfg['store']} --system {cfg['system']} --model-key KEY)")
     except (OSError, urllib.error.URLError, ValueError) as e:
         print(f"note: couldn't share the system's config ({e}): new nodes can't join until it is (run this again)")
     if a.reviewer == "none":
@@ -3178,7 +3144,7 @@ def install_finial_unit(cfg_path: str, no_service: bool, force: bool) -> None:
 
 # ---- cluster: every instance of a system runs the same thing (a finial); what the system knows lives in the
 # store at PREFIX/systems/system=NAME/, so any node can drop out at any moment and lose nothing:
-#   config.json         the shared config and the reviewer's model API (its key's variable name, never the key)
+#   config.json         the shared config and the reviewer's model API (never its key)
 #   interpreter/vN.json every version (created only if absent: two nodes can't both make vN; the loser is told)
 #   charter.md          the reviewer's REVIEW.md (last writer wins; a clash is kept aside and told)
 #   ledger/EVENT.json   findings events, one object each (never overwritten); every node folds the same events
@@ -3744,66 +3710,79 @@ def share_config(cfg: dict, cfg_path: str, store=None) -> str:
     return k
 
 
-def join(argv: list[str]) -> None:
-    """eaveswatch join STORE SYSTEM: a new instance (an ASG's user-data) joins its system, with no questions. The
-    shared config comes from the store, the rest (interpreter, charter, findings) on the first tick; secrets from
-    the environment: the model key from the variable the system names, AWS credentials from the instance profile."""
-    ap = argparse.ArgumentParser(prog="eaveswatch join", description=join.__doc__.split("\n")[0])
-    ap.add_argument("store", help="s3://bucket/prefix (or a folder) the system shares")
-    ap.add_argument("system")
-    ap.add_argument("--host", help="this instance's name (default: its hostname)")
-    ap.add_argument("--no-service", action="store_true")
-    ap.add_argument("--no-reviewer", action="store_true", help="collect and share, without a reviewer on this node")
-    ap.add_argument("--force", action="store_true", help="replace an existing setup here")
+def boot(argv: list[str]) -> None:
+    """eaveswatch boot --store S3URL --system NAME [...]: set this box up as a node of its system, with no questions,
+    on every boot: join the system if it's in the store, create it from these flags if not. Everything comes in by
+    flag (feed them from whatever variables you keep); AWS access is the instance's own."""
+    ap = argparse.ArgumentParser(prog="eaveswatch boot", description=boot.__doc__.split("\n")[0])
+    ap.add_argument("--store", required=True, help="s3://bucket/prefix (or a folder) the system shares")
+    ap.add_argument("--system", required=True, help="the name this system's nodes share")
+    ap.add_argument("--model-url", help="the reviewer's model API (as for hobkin: https://.../v1)")
+    ap.add_argument("--model", help="the reviewer's model")
+    ap.add_argument("--model-key", help="the reviewer's model key (kept by the reviewer harness, never in the store)")
+    ap.add_argument("--reviewer", choices=sorted(REVIEWERS) + ["none"],
+                    help="the reviewer harness (default: the system's, else hobkin when a model is given)")
+    ap.add_argument("--alert-email", help="where alerts and the reviewer's notes go")
+    ap.add_argument("--smtp", help="send through this SMTP relay (host:port) instead of the box's sendmail")
+    ap.add_argument("--publish-dir", help="a folder a web server already serves, for the findings page")
+    ap.add_argument("--env", help="the env= prefix (default: the system's, else prod)")
+    ap.add_argument("--host", help="this node's name (default: its hostname)")
+    ap.add_argument("--collector", action="store_true", help="collect and share only: never lead or review")
+    ap.add_argument("--no-service", action="store_true", help="don't install or start user services")
     a = ap.parse_args(argv)
     cfg_path = os.path.expanduser(SETUP_CONFIG)
-    if os.path.exists(cfg_path) and not a.force:
-        sys.exit(f"eaveswatch: {cfg_path} exists: this box is set up already (--force replaces it)")
     region = (bucket_region(urllib.parse.urlsplit(a.store).netloc) or imds_region() or os.environ.get("AWS_REGION")
               or "us-east-1") if a.store.startswith("s3://") else None
     store = S3Store(a.store, region) if a.store.startswith("s3://") else FolderStore(a.store)
     shared, _ = jget(store, f"systems/system={safe_name(a.system)}/config.json")
-    if not shared:
-        sys.exit(f"eaveswatch: no system {a.system!r} at {a.store}: set its first node up with "
-                 f"`eaveswatch URL MODEL --system {a.system}`, which shares the config")
-    user = {**shared.get("config", {}), "system": a.system, **({"host": a.host} if a.host else {})}
-    user.setdefault("state_dir", SETUP_STATE)
-    if a.no_reviewer:
+    sys_cfg = dict((shared or {}).get("config") or {})
+    rv = dict((shared or {}).get("reviewer") or {})
+    # the flags win: every node of a system boots from the same launch template, so they agree
+    sys_cfg.update(role="finial", system=a.system, store=a.store, env=a.env or sys_cfg.get("env") or "prod")
+    if a.alert_email:
+        sys_cfg["notify"] = {"email": a.alert_email, **({"smtp": a.smtp} if a.smtp else {})}
+    if a.publish_dir:
+        sys_cfg["publish"] = {"dir": a.publish_dir}
+    if a.model_url:
+        rv["url"] = a.model_url
+    if a.model:
+        rv["model"] = a.model
+    rv["adapter"] = a.reviewer or rv.get("adapter") or ("hobkin" if rv.get("url") else "none")
+    user = {**sys_cfg, "state_dir": SETUP_STATE, **({"region": region} if region else {}), **({"host": a.host} if a.host else {})}
+    if a.collector:
         user["role"] = "eave"
-    if region:
-        user["region"] = region
     write_json(cfg_path, user)
     cfg = load_config(cfg_path)
     os.makedirs(cfg["ridge"]["data"], exist_ok=True)
-    rv = shared.get("reviewer")
-    if rv:
-        write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), rv)
-    write_json(os.path.join(cfg["ridge"]["data"], "joined.json"), {"system": a.system, "from_host": shared.get("from_host"),
-                                                                  "at": iso(now_utc())})
-    print(f"joined {a.system} (config shared by {shared.get('from_host')}) as {cfg['host']}: {cfg_path}")
+    write_json(os.path.join(cfg["ridge"]["data"], "reviewer.json"), rv)
+    mine = {"config": {k: user[k] for k in SYSTEM_CONFIG_KEYS if k in user}, "reviewer": rv}
+    if not a.collector and (not shared or {k: shared.get(k) for k in ("config", "reviewer")} != mine):
+        share_config(cfg, cfg_path, store)            # created, or the flags changed it (a collector only reads it)
+    print(("joined" if shared else "created") + f" system {a.system} in {a.store} as {cfg['host']} ({cfg_path})")
+    if shared:
+        write_json(os.path.join(cfg["ridge"]["data"], "joined.json"), {"system": a.system, "at": iso(now_utc())})
     node = Node(cfg, store)
-    for line in node.tick():                         # the interpreter, charter and findings, now
+    for line in node.tick():                          # the interpreter, charter and findings, now
         print(f"  {line}")
     text, _ = run_check(cfg, cfg_path)
     fatal = [l for l in text.splitlines() if l.startswith("  FAIL") and not l.startswith(("  FAIL  source", "  FAIL  service"))]
     if fatal:
         print(text)
-        sys.exit("eaveswatch: fix what check says, then run this again (with --force)")
-    print("check: the store, credentials and alerts are good")
-    install_finial_unit(cfg_path, a.no_service, a.force)
-    if a.no_reviewer or cfg["role"] != "finial":
+        sys.exit("eaveswatch: boot stopped: fix what check says (the services may still be starting: sources can wait)")
+    print("check: the store and the alert channel are good" + ("" if text.count("FAIL") == 0 else
+          " (some sources aren't there yet: the reviewer will see)"))
+    install_finial_unit(cfg_path, a.no_service, True)
+    if a.collector or rv["adapter"] == "none":
+        if not a.collector:
+            print(f"no reviewer harness: give yours the contract: {eaveswatch_cmd()} --config {cfg_path} reviewer contract")
         return
-    adapter = (rv or {}).get("adapter", "none")
-    if adapter == "none" or adapter not in REVIEWERS:
-        print(f"no reviewer adapter in the system's config: give your agent harness the contract:\n  "
-              f"{eaveswatch_cmd()} --config {cfg_path} reviewer contract")
-        return
-    key = os.environ.get(rv.get("key_env") or "EAVESWATCH_MODEL_KEY")
-    if not key:
-        sys.exit(f"eaveswatch: the reviewer's model key isn't in ${rv.get('key_env') or 'EAVESWATCH_MODEL_KEY'}: set it "
-                 "(from your secret store) and run this again with --force, or --no-reviewer")
-    REVIEWERS[adapter].start(cfg, cfg_path, rv["url"], rv["model"], key, a.no_service, False,
-                             f"starting the reviewer ({adapter}): it reviews what the system routes to this node")
+    if not (rv.get("url") and rv.get("model")):
+        sys.exit("eaveswatch: the reviewer needs its model API: --model-url URL --model MODEL --model-key KEY "
+                 "(or --reviewer none)")
+    if not a.model_key:
+        sys.exit("eaveswatch: the reviewer needs its model key: --model-key KEY (from wherever you keep it)")
+    REVIEWERS[rv["adapter"]].start(cfg, cfg_path, rv["url"], rv["model"], a.model_key, a.no_service, False,
+                                   f"starting the reviewer ({rv['adapter']})")
 
 
 # ---- command line
@@ -3855,7 +3834,6 @@ def cli(argv: list[str] | None = None) -> None:
     f.add_argument("--why")
     f.add_argument("--all", action="store_true")
     sub.add_parser("check")
-    sub.add_parser("iam")
     sub.add_parser("watch", help="for the reviewer's wake: this node's claimed review, answers, notes; or nothing")
     jb = sub.add_parser("job", help="the reviewer's side of a review job")
     jb.add_argument("action", choices=("done", "release", "list"))
@@ -3878,8 +3856,8 @@ def cli(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv and (re.match(r"https?://", argv[0]) or argv[0] == "setup"):    # eaveswatch URL MODEL [KEY]: the one-line setup
         return setup(argv[1:] if argv[0] == "setup" else argv)
-    if argv and argv[0] == "join":                     # a new instance joins its system (an ASG's user-data)
-        return join(argv[1:])
+    if argv and argv[0] == "boot":                     # every boot, every node: join the system, or create it
+        return boot(argv[1:])
     args = ap.parse_args(argv)
     if args.cmd == "reviewer" and args.action == "install":     # needs no config
         if not args.adapter:
@@ -3927,11 +3905,6 @@ def cli(argv: list[str] | None = None) -> None:
         path = os.path.expanduser(args.config or os.environ.get("EAVESWATCH_CONFIG") or "eaveswatch.json")
         print(json.dumps(reviewer_contract(cfg, path), indent=2) if args.action == "contract"
               else reviewer_instructions(cfg, path, repos=args.repos))
-        return
-    if args.cmd == "iam":
-        if not cfg["store"].startswith("s3://"):
-            sys.exit(f"eaveswatch: the store is a folder ({cfg['store']}): no IAM policy needed")
-        print(json.dumps(iam_policy(cfg), indent=2))
         return
     if args.cmd == "notify":
         if args.test:
