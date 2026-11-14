@@ -328,7 +328,10 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
         self.verify()
         u = urllib.parse.urlsplit(self.path)
         q = dict(urllib.parse.parse_qsl(u.query))
-        if q.get("list-type") == "2":
+        if u.path == "/" and not q:                    # ListAllMyBuckets: what broad credentials can see
+            body = (b'<?xml version="1.0"?><ListAllMyBucketsResult><Buckets><Bucket><Name>bucket</Name></Bucket>'
+                    b'<Bucket><Name>payroll-exports</Name></Bucket></Buckets></ListAllMyBucketsResult>')
+        elif q.get("list-type") == "2":
             bucket = u.path.strip("/")
             pre = f"/{bucket}/" + q.get("prefix", "")
             keys = sorted(k[len(bucket) + 2:] for k in FakeS3.objects if k.startswith(pre))
@@ -605,6 +608,159 @@ o4 = subprocess.run([sys.executable, EW, "https://api.example.test/v1", "some-mo
                     text=True, stdin=subprocess.DEVNULL, env={**senv, "HOME": fresh, "AWS_REGION": "us-east-1"})
 check("[setup] with no bucket and nobody to ask (no terminal), it says to give --bucket, and writes nothing",
       o4.returncode != 0 and "--bucket" in o4.stderr and not os.path.exists(os.path.join(fresh, ".config", "eaveswatch")), o4.stderr)
+
+# ---- alerts: rules checked by the eave, delivered by the loop; the findings page; IAM
+ab = tempfile.mkdtemp(prefix="eaveswatch-alerts-")
+alog = os.path.join(ab, "app.log")
+open(alog, "w").close()
+mailbox = os.path.join(ab, "mailbox.txt")
+fake_sendmail = os.path.join(ab, "sendmail")
+open(fake_sendmail, "w").write(f"#!/bin/sh\ncat >> {mailbox}\necho '----' >> {mailbox}\n")
+os.chmod(fake_sendmail, 0o755)
+pub = os.path.join(ab, "www")
+os.makedirs(pub)
+acfg = ew.make_config({"store": os.path.join(ab, "store"), "env": "test", "host": "ps1", "role": "finial",
+                       "state_dir": os.path.join(ab, "state"), "publish": {"dir": pub},
+                       "notify": {"email": "me@example.test", "sendmail": fake_sendmail, "per_hour": 3}})
+aerr = ew.validate_spec({"sources": [{"name": "app", "path": alog}], "alerts": [
+    {"name": "x"}, {"name": "y", "match": {"template": "(", "count": 0}}, {"name": "z", "silent": {"source": "nope", "minutes": 5}},
+    {"name": "w", "unit_failed": ["a"], "match": {"level": "error"}, "severity": "loud"}]})
+check("[alerts] rules are validated: one kind each, regexes, sources that exist, counts, severities",
+      all(any(b in e for e in aerr) for b in ["(x): give exactly one", "bad regex", "match.count", "(z).silent", "(w): give exactly one",
+                                                "severity is page or warn"]), aerr)
+ew.apply_spec(acfg, spec_file({"sources": [{"name": "app", "path": alog, "from_start": True}], "warmup_minutes": 0, "alerts": [
+    {"name": "db-down", "severity": "page", "about": "the app can't reach its database",
+     "match": {"template": "connection refused", "count": 3, "minutes": 5}},
+    {"name": "app-quiet", "silent": {"source": "app", "minutes": 1}},
+    {"name": "unit-failed", "severity": "page", "unit_failed": ["psappsrv.service"]}]}, ab), "alerts")
+ar = ew.Ridge(acfg)
+ae = ew.Eave(acfg, inbox=ar.p("inbox"))
+ae.failed_units = lambda: set()
+write(alog, ["ERROR connection refused to db:1521"] * 2)
+ae.tick()
+q = lambda: sorted(os.listdir(ew.notify_dir(acfg, "queue"))) if os.path.isdir(ew.notify_dir(acfg, "queue")) else []
+check("[alerts] under the count in the window: nothing fires", q() == [])
+write(alog, ["ERROR connection refused to db:1521"] * 2)
+ae.tick()
+note = ew.read_json(ew.notify_dir(acfg, "queue", q()[0]), {}) if q() else {}
+check("[alerts] over it: fires once, queued for the person straight away (a finial), with the samples and why",
+      len(q()) == 1 and note.get("severity") == "page" and "db-down" in note.get("subject", "")
+      and "4 matching entries in 5 min" in note.get("body", "") and "the app can't reach its database" in note["body"]
+      and "ERROR connection refused to db:1521" in note["body"], note)
+write(alog, ["ERROR connection refused to db:1521"] * 5)
+ae.tick()
+check("[alerts] within the cooldown it doesn't fire again", len(q()) == 1, q())
+ae.failed_units = lambda: {"psappsrv.service", "other.service"}
+ae.state["alert_state"]["heard"]["app"] = time.time() - 120
+ae.tick()
+subjects = [ew.read_json(ew.notify_dir(acfg, "queue", n), {}).get("subject", "") for n in q()]
+check("[alerts] a failed unit it names, and a source gone quiet, fire too",
+      any("unit-failed: psappsrv.service has failed" in x for x in subjects) and not any("other.service" in x for x in subjects)
+      and any("app-quiet: app has written nothing for 2 min" in x for x in subjects), subjects)
+sent, left = ew.deliver_notes(acfg)
+mail = open(mailbox).read() if os.path.exists(mailbox) else ""
+check("[alerts] delivered by sendmail, at most per_hour an hour (the rest wait, and the last says so)",
+      sent == 3 and left == 0 and mail.count("----") == 3 and "Subject: [ALERT] ps1: db-down" in mail and "To: me@example.test" in mail,
+      (sent, left, mail[:600]))
+ew.queue_note(acfg, "one more", "x")
+check("[alerts] over the hourly cap, a note waits in the queue", ew.deliver_notes(acfg) == (0, 1) and len(q()) == 1)
+d_alerts = ar.watch()
+check("[alerts] the digest starts with what fired (already sent: follow up), and keeps them for the page",
+      d_alerts.split("\n\n")[1].startswith("## Alerts fired") and "**db-down** [page]" in d_alerts
+      and os.path.exists(ar.p("alerts.jsonl")), d_alerts[:600])
+ew.finding_add(acfg, {"category": "security/injection", "location": "app <log>", "claim": "a log line said <script>alert(1)</script>",
+                      "evidence": "e", "scenario": "s", "action": "a", "confidence": "low"})
+where = ew.publish_report(acfg)
+page = open(os.path.join(pub, "index.html")).read()
+check("[report] the findings page: open findings, recent alerts, what's collected; copied to the web folder",
+      where == pub and "Open findings" in page and "db-down" in page and "unit-failed" in page
+      and os.path.exists(ar.p("report", "index.html")), where)
+check("[report] text from logs is escaped (it can't run in the page)",
+      "<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)&lt;/script&gt;" in page)
+check("[report] unchanged, it isn't written again", ew.publish_report(acfg) is None)
+unsent_cfg = ew.make_config({"store": os.path.join(ab, "s2"), "env": "test", "host": "ps2", "role": "finial", "state_dir": os.path.join(ab, "st2")})
+ew.queue_note(unsent_cfg, "hello", "x")
+check("[alerts] with no channel, notes are kept (notify/unsent), not lost", ew.deliver_notes(unsent_cfg) == (0, 0)
+      and os.listdir(ew.notify_dir(unsent_cfg, "unsent")))
+
+# SMTP, by a relay (a tiny one here)
+import socketserver
+got_mail = []
+
+
+class SMTP(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.wfile.write(b"220 fake\r\n")
+        data = False
+        buf = []
+        for raw in self.rfile:
+            line = raw.decode(errors="replace").rstrip("\r\n")
+            if data:
+                if line == ".":
+                    got_mail.append("\n".join(buf)); data = False; self.wfile.write(b"250 ok\r\n")
+                else:
+                    buf.append(line)
+                continue
+            cmd = line[:4].upper()
+            if cmd == "DATA":
+                data = True; self.wfile.write(b"354 go\r\n")
+            elif cmd == "QUIT":
+                self.wfile.write(b"221 bye\r\n"); return
+            else:
+                self.wfile.write(b"250 ok\r\n")
+
+
+smtp = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SMTP)
+threading.Thread(target=smtp.serve_forever, daemon=True).start()
+scfg2 = ew.make_config({"store": os.path.join(ab, "s3"), "env": "test", "host": "ps3", "role": "finial", "state_dir": os.path.join(ab, "st3"),
+                        "notify": {"email": "me@example.test", "smtp": f"127.0.0.1:{smtp.server_address[1]}"}})
+ew.queue_note(scfg2, "by relay", "through SMTP")
+check("[alerts] by an SMTP relay instead of sendmail", ew.deliver_notes(scfg2) == (1, 0) and got_mail and "through SMTP" in got_mail[0],
+      got_mail)
+ctext, cprob = ew.run_check(scfg2, "x.json")
+check("[check] the alert channel is checked (the relay answers; nothing is sent)", "ok    alerts: to me@example.test by SMTP" in ctext
+      and len(got_mail) == 1, ctext)
+
+# the commands: notify (from hobkin's alert_command too), notify --test, iam
+acfg_path = os.path.join(ab, "acfg.json")
+json.dump({"store": acfg["store"], "env": "test", "host": "ps1", "role": "finial", "state_dir": acfg["state_dir"],
+           "notify": {"email": "me@example.test", "sendmail": fake_sendmail, "per_hour": 50}}, open(acfg_path, "w"))
+on = subprocess.run([sys.executable, EW, "--config", acfg_path, "notify"], capture_output=True, text=True,
+                    env={**os.environ, "HOBKIN_ALERT": "hobkin eaveswatch paused: the model refused"}, stdin=subprocess.DEVNULL)
+check("[notify] hobkin's alert_command ($HOBKIN_ALERT) is queued for the person",
+      on.returncode == 0 and "queued:" in on.stdout and any("model refused" in json.dumps(ew.read_json(ew.notify_dir(acfg, "queue", n), {}))
+                                                           for n in q()), on.stdout + on.stderr)
+ot = cli("--config", acfg_path, "notify", "--test")
+check("[notify] --test sends one now", ot.returncode == 0 and "sent" in ot.stdout and "test note" in open(mailbox).read(), ot.stdout + ot.stderr)
+oi = cli("--config", acfg_path, "iam")
+pol = json.loads(oi.stdout) if oi.returncode == 0 else {}
+check("[iam] the least a finial needs: one PutObject on its own host's prefix",
+      [st["Action"] for st in pol.get("Statement", [])] == ["s3:PutObject"] and pol["Statement"][0]["Resource"].endswith("*/host=ps1/*"), oi.stdout)
+s3f = ew.make_config({"store": "s3://bucket/eaves/v1", "env": "test", "host": "ps9", "role": "finial", "state_dir": tempfile.mkdtemp()})
+btext, _ = ew.run_check(s3f, "x", ew.S3Store("s3://bucket/eaves/v1", endpoint=f"http://127.0.0.1:{srv.server_port}"))
+check("[check] credentials that can list every bucket are noticed, and `iam` named", "warn  credentials: they can list every bucket (2)" in btext
+      and "eaveswatch iam" in btext, btext)
+# a fleet: the ridge's sync sends alerts from the store on to the person
+fl_store = os.path.join(ab, "fleet-store")
+fe_cfg = ew.make_config({"store": fl_store, "env": "test", "host": "web-1", "state_dir": os.path.join(ab, "fe")})
+fr_cfg = ew.make_config({"store": fl_store, "env": "test", "host": "hub", "role": "ridge", "state_dir": os.path.join(ab, "fr")})
+ew.FolderStore(fl_store).put(ew.object_key("test", "alerts", "web-1", ew.now_utc()),
+                             ew.pack([{"rule": "r1", "severity": "page", "host": "web-1", "at": "x", "detail": "it broke"}]))
+ew.Ridge(fr_cfg).sync()
+fq = os.listdir(ew.notify_dir(fr_cfg, "queue"))
+check("[alerts] in a fleet, the ridge queues an eave's alert as it syncs it", len(fq) == 1
+      and "r1: it broke" in ew.read_json(ew.notify_dir(fr_cfg, "queue", fq[0]), {})["subject"])
+
+# setup asks where alerts go and about the web folder; flags answer instead
+sh2 = tempfile.mkdtemp(prefix="eaveswatch-setup3-")
+os.makedirs(os.path.join(sh2, "www"))
+o5 = subprocess.run([sys.executable, EW, "https://api.example.test/v1", "m", "--store", os.path.join(sh2, "store"), "--no-service",
+                     "--alert-email", "me@example.test", "--publish-dir", os.path.join(sh2, "www")], capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, env={**senv, "HOME": sh2})
+c5 = json.load(open(os.path.join(sh2, ".config", "eaveswatch", "finial.json"))) if o5.returncode == 0 else {}
+check("[setup] where alerts go and the web folder for the findings page, from flags (asked for at a terminal)",
+      c5.get("notify", {}).get("email") == "me@example.test" and c5.get("publish", {}).get("dir") == os.path.join(sh2, "www")
+      and "anyone who can reach that site sees the findings" in o5.stdout, o5.stdout + o5.stderr)
 
 print("\nALL PASSED" if not FAILED else f"\nFAILED: {len(FAILED)}")
 sys.exit(1 if FAILED else 0)

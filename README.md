@@ -55,7 +55,15 @@ eaveswatch https://openrouter.ai/api/v1 anthropic/claude-sonnet-4.5 sk-or-...   
 Running as that user lets discovery see the services' own open files,
 sockets and environment, with no root and no extra capabilities.
 
-The one command asks which S3 bucket to use (showing the ones it can see).
+The one command asks you three things:
+- **Which S3 bucket** to use, showing the ones it can see.
+- **Where alerts go:** an email address. It sends through the box's
+  `sendmail`, or through an SMTP relay if the box has none, and offers a test
+  message. Leave it blank and alerts are kept in the data folder for now.
+- **Which folder a web server here already serves**, for the findings page.
+  Anyone who can reach that site sees the findings. Leave it blank and the
+  page is in `~/eaveswatch/ridge/report/` either way.
+
 Everything else is decided for you:
 - **Region:** the bucket's own.
 - **Credentials:** the instance profile.
@@ -71,7 +79,8 @@ reviewer chore, and hands over to hobkin. You end up in a chat with the
 reviewer. Run it again later and it reuses the same setup.
 
 Options:
-- `--bucket NAME`, so nothing is asked
+- `--bucket NAME`, `--alert-email ADDR` (with `--smtp host:port` for a relay),
+  `--publish-dir DIR`: answers, so nothing is asked
 - `--store s3://bucket/prefix`, or a folder to try it without S3
 - `--env`, `--host`
 - `--no-service`, `--no-chat`
@@ -81,7 +90,8 @@ The reviewer then:
 1. runs `discover`
 2. tells you in a few lines what it found ("a PeopleSoft app server domain
    HRDEV, a PIA on 8000...")
-3. proposes what to collect, watch and archive, with a recommendation for each
+3. proposes what to collect, watch and archive, and **what should alert you at
+   once**, with a recommendation for each
 4. asks what you care about
 5. writes, tests and applies the interpreter, and tells you what's now collected
 
@@ -89,8 +99,33 @@ Discovery runs again every hour. What changed (new units, programs,
 listeners, logs written but not collected) comes in its digest. It fixes and
 narrows the interpreter on its own, and asks you before adding a source.
 
-IAM for a finial is one permission: `s3:PutObject` on `PREFIX/*/host=HOST/*`
-([examples/iam/finial.json](examples/iam/finial.json)).
+IAM for a finial is one permission: `s3:PutObject` on `PREFIX/*/host=HOST/*`.
+`eaveswatch iam` prints that exact policy for this box. If the credentials can
+do far more (an instance profile with full S3 access, say), `check` says so,
+and the reviewer raises it at setup.
+
+## Alerts and the findings page
+
+- **Alerts are fast and plain code.** The interpreter's `alerts` rules (the
+  reviewer proposes them, you agree) are checked every tick. Each has a
+  cooldown and a severity (`page` or `warn`). There are three kinds:
+  - `match`: N entries matching a template or level in M minutes
+  - `unit_failed`: a named unit has failed, user or system
+  - `silent`: a source has written nothing for M minutes
+- **When one fires, you get a terse email at once.** The reviewer is woken
+  (its watch runs every minute, free when quiet) and follows up within
+  minutes with what it means and what to do.
+- **Everything for a person goes through one queue:** fired alerts, the
+  reviewer's notes (`eaveswatch notify TEXT`, which works from its sandbox), and
+  hobkin's own "I've paused". The loop sends it, at most `per_hour` (20) an
+  hour. With no channel set, notes are kept in `DATA/notify/unsent/`.
+  `eaveswatch notify --test` sends one now. SNS is the likely next channel.
+- **The findings page** is rendered by the loop whenever something changes:
+  open findings with their evidence, recent alerts, digests, hosts and
+  versions, and what's collected. It's written to `DATA/report/index.html`,
+  and copied to the publish folder if there is one. It's static HTML with
+  everything escaped, because it shows text from logs that others write, and
+  eaveswatch serves nothing itself.
 
 ## The interpreter
 
@@ -145,6 +180,7 @@ PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=ps-hr-01/ps-hr-01_202611
   - `flows`
   - `raw`: redacted entries of sources marked `raw`, which is the archive
   - `requests` and `answers`: asks
+  - `alerts`: what fired, and why
   - `check`: probes, which a lifecycle rule can expire
 - **Nothing is lost when the store is away.** Every file is spooled to disk
   before the eave saves its place in the logs, then sent oldest first. Past
@@ -228,6 +264,8 @@ Plumbing only; what to collect is the interpreter's.
 | `inventory_every` | `3600` | inventory and flows: on change, and at least this often |
 | `discover_every` | `3600` | a finial's look at what runs here |
 | `spool_max_mb` | `512` | the most kept waiting for the store |
+| `notify` | | where alerts and notes go: `{"email", "sendmail"}` or `{"email", "smtp": "host:port"}`, plus `from` and `per_hour` |
+| `publish` | | `{"dir": PATH}`: a folder a web server already serves, for the findings page |
 | `ridge` | | `data`, `envs`, `silent_after`, `late_hours` (`24`), `late_every` (`600`) |
 
 ## Tests

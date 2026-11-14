@@ -14,6 +14,8 @@
     eaveswatch finding add < finding.json       record a finding (seen again: the same one, counted)
     eaveswatch finding list [--all]             open findings (--all: every one)
     eaveswatch finding status ID STATUS [--why TEXT]    accepted, fixed, dismissed (with why), reopened
+    eaveswatch notify TEXT [--severity page]    a note for the person (queued; the loop sends it): --test sends one now
+    eaveswatch iam                              the least S3 access this role needs, as an IAM policy
     eaveswatch check                            is this set up right? store, credentials, clock, interpreter, sources
     eaveswatch chore [DIR] [--force]            write the reviewer chore where hobkin finds it (~/.hobkins/_shared/chores)
     eaveswatch key KIND [HOST]                  where a file of KIND from HOST would go now (to check a layout)
@@ -40,13 +42,14 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #                flows, the spool, answering asks
 #   ridge        sync (store -> data folder, asks -> store), the map, the digest (watch)
 #   findings     the ledger: add, seen again, status, list
+#   notify       the queue for people (alerts, the reviewer's notes), sendmail/SMTP delivery; the findings page; IAM
 #   the reviewer the hobkin chore (chore.json, CHORE.md), written out by `eaveswatch chore`
 #   check        `eaveswatch check`: each role's permissions, the interpreter, sources, versions, clock, a preview
 #   setup        `eaveswatch URL MODEL [KEY]`: a finial in one command, then hobkin's own setup with the chore
 #   command line
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import argparse
 import configparser
@@ -87,12 +90,15 @@ DEFAULTS = {
     "inventory_every": 3600,     # inventory and flows are sent when they change, and at least this often
     "discover_every": 3600,      # a finial looks again at what runs here this often (changes go in the digest)
     "spool_max_mb": 512,         # files wait in STATE_DIR/spool until the store takes them; over this, the oldest go
+    "notify": None,              # where alerts and the reviewer's notes go: {"email": ADDR, "sendmail": PATH} or
+                                 # {"email": ADDR, "smtp": "host:port"}; "from", "per_hour" (20). None: kept, not sent
+    "publish": None,             # {"dir": PATH}: a folder a web server already serves; the findings page is copied there
     "ridge": {"data": None, "envs": None, "silent_after": 7200,    # data default: STATE_DIR/ridge
               "late_hours": 24, "late_every": 600},   # every late_every s, look this far back for late arrivals
 }
 ROLES = ("eave", "ridge", "finial")
-KINDS = ("packets", "inventory", "flows", "raw", "requests", "answers", "check")   # check: probes from `eaveswatch check`
-RIDGE_READS = ("packets", "inventory", "flows", "answers")     # never raw: the reviewer doesn't read the archive
+KINDS = ("packets", "inventory", "flows", "raw", "requests", "answers", "alerts", "check")   # check: `eaveswatch check`'s probes
+RIDGE_READS = ("packets", "inventory", "flows", "answers", "alerts")   # never raw: the reviewer doesn't read the archive
 
 
 def load_config(path: str | None) -> dict:
@@ -443,10 +449,12 @@ STARTER_SPEC = {
     "max_samples": 3,
     "spike": 4.0,
     "warmup_minutes": 60,
+    "alerts": [],
 }
+ALERT_KINDS = ("match", "unit_failed", "silent")
 SPEC_TYPES = {"version": int, "about": str, "sources": list, "placeholders": list, "level": (dict, type(None)),
               "redact": list, "services": dict, "watch": list, "max_template": int, "max_samples": int,
-              "spike": (int, float), "warmup_minutes": int}
+              "spike": (int, float), "warmup_minutes": int, "alerts": list}
 SOURCE_TYPES = {"name": str, "path": str, "journald": dict, "service": (str, type(None)), "multiline": (dict, type(None)),
                 "drop": list, "keep": list, "level": (dict, type(None)), "timestamp": (dict, type(None)), "raw": bool,
                 "from_start": bool, "placeholders": list, "about": str}
@@ -568,6 +576,45 @@ def validate_spec(spec) -> list[str]:
                 errs.append(f"{w}.placeholders[{j}]: needs a \"name\" and a \"pattern\"")
             else:
                 regex(f"{w}.placeholders[{j}]", p.get("pattern"), flags=compile_flags(p))
+    anames = set()
+    for i, a in enumerate(spec.get("alerts") or []):
+        w = f"alerts[{i}]"
+        if not isinstance(a, dict) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(a.get("name", ""))):
+            errs.append(f"{w}: needs a \"name\" (letters, digits, _ . -)")
+            continue
+        w = f"alerts[{i}] ({a['name']})"
+        if a["name"] in anames:
+            errs.append(f"{w}: the name is used twice")
+        anames.add(a["name"])
+        extra = set(a) - {"name", "about", "severity", "cooldown_minutes", *ALERT_KINDS}
+        if extra:
+            errs.append(f"{w}: unknown {', '.join(sorted(extra))} (severity, cooldown_minutes, and one of {', '.join(ALERT_KINDS)})")
+        kinds = [k for k in ALERT_KINDS if k in a]
+        if len(kinds) != 1:
+            errs.append(f"{w}: give exactly one of {', '.join(ALERT_KINDS)}")
+        if a.get("severity", "warn") not in ("page", "warn"):
+            errs.append(f"{w}: severity is page or warn")
+        if "cooldown_minutes" in a and (not isinstance(a["cooldown_minutes"], (int, float)) or a["cooldown_minutes"] < 0):
+            errs.append(f"{w}: cooldown_minutes is a number of minutes")
+        m = a.get("match")
+        if m is not None:
+            if not isinstance(m, dict) or not (m.get("template") or m.get("level")):
+                errs.append(f"{w}.match: {{\"template\": REGEX and/or \"level\": error|warn, \"source\", \"count\" (1), \"minutes\" (5)}}")
+            else:
+                if m.get("template"):
+                    regex(f"{w}.match.template", m["template"])
+                if m.get("level") and m["level"] not in RANK:
+                    errs.append(f"{w}.match.level: error, warn, info or debug")
+                if m.get("source") and m["source"] not in names:
+                    errs.append(f"{w}.match.source: no source named {m['source']!r}")
+                for k in ("count", "minutes"):
+                    if k in m and (not isinstance(m[k], int) or m[k] < 1):
+                        errs.append(f"{w}.match.{k}: a whole number, 1 or more")
+        if "unit_failed" in a and not (isinstance(a["unit_failed"], list) and all(isinstance(u, str) for u in a["unit_failed"])):
+            errs.append(f"{w}.unit_failed: a list of unit names (\"*\" for any), user or system")
+        sl = a.get("silent")
+        if sl is not None and not (isinstance(sl, dict) and sl.get("source") in names and isinstance(sl.get("minutes"), int)):
+            errs.append(f"{w}.silent: {{\"source\": a source's name, \"minutes\": N}}")
     for name, svc in (spec.get("services") or {}).items():
         w = f"services.{name}"
         if not isinstance(svc, dict):
@@ -619,6 +666,12 @@ class Interpreter:
             c["_ts"] = re.compile(src["timestamp"]["pattern"]) if src.get("timestamp") else None
             c["_places"] = [self._place(p) for p in src.get("placeholders") or []]
             self.sources.append(c)
+        self.alerts = []
+        for a in s.get("alerts") or []:
+            c = {**a, "severity": a.get("severity", "warn"), "cooldown": float(a.get("cooldown_minutes", 30)) * 60}
+            if a.get("match"):
+                c["_tm"] = re.compile(a["match"]["template"]) if a["match"].get("template") else None
+            self.alerts.append(c)
 
     @staticmethod
     def _place(p):
@@ -1485,6 +1538,11 @@ class Eave:
         lines_by_src = {}
         for src, line, prio in self.read_sources():
             lines_by_src.setdefault(src["name"], (src, []))[1].append((line, prio))
+        heard = self.state.setdefault("alert_state", {}).setdefault("heard", {})
+        for src in it.sources:
+            heard.setdefault(src["name"], t.timestamp())        # silence counts from when a source is first watched
+        for name in lines_by_src:
+            heard[name] = t.timestamp()
         for name, (src, items) in lines_by_src.items():
             prios = [p for _, p in items]
             for i, entry in enumerate(it.entries(src, [l for l, _ in items])):
@@ -1533,6 +1591,12 @@ class Eave:
             written.append(self.put("packets", records, t))
         if raw:
             written.append(self.put("raw", raw, t))
+        fired = self.check_alerts(t, agg)
+        if fired:
+            written.append(self.put("alerts", fired, t))
+            if self.inbox:                               # a finial: straight to the person (a fleet's ridge does it on sync)
+                for a in fired:
+                    queue_note(cfg, f"{a['rule']}: {a['detail'][:120]}", alert_body(a), a["severity"], "alert")
         written += self.maybe_inventory(t, versions)
         try:
             written += self.answer_asks(t)
@@ -1557,6 +1621,55 @@ class Eave:
                 self.state.pop("spool_dropped_new", None)
         self.save()
         return written
+
+    # --- alerts: the spec's rules, checked every tick in plain code (no model): fast, and each with a cooldown
+    def failed_units(self) -> set[str]:
+        out = set()
+        for scope in (["--user"], []):
+            for l in run(["systemctl"] + scope + ["list-units", "--state=failed", "--no-legend", "--plain"]).splitlines():
+                if l.strip():
+                    out.add(l.split()[0])
+        return out
+
+    def check_alerts(self, t: dt.datetime, agg: dict) -> list[dict]:
+        now, st = t.timestamp(), self.state.setdefault("alert_state", {})
+        fired_at, windows, heard = st.setdefault("fired", {}), st.setdefault("window", {}), st.setdefault("heard", {})
+        failed = self.failed_units() if any("unit_failed" in a for a in self.interp.alerts) else set()
+        out = []
+
+        def fire(a, key, detail, **evidence):
+            if now - fired_at.get(key, 0) < a["cooldown"]:
+                return
+            fired_at[key] = now
+            out.append({"rule": a["name"], "severity": a["severity"], "host": self.cfg["host"], "env": self.cfg["env"],
+                        "at": iso(t), "detail": detail, "about": a.get("about"), "interpreter": self.interp.version, **evidence})
+        for a in self.interp.alerts:
+            if a.get("match"):
+                m = a["match"]
+                hits = [r for r in agg.values() if (not m.get("source") or r["source"] == m["source"])
+                        and (a["_tm"] is None or a["_tm"].search(r["template"]))
+                        and (not m.get("level") or RANK.get(r.get("level") or "debug", 9) <= RANK[m["level"]])]
+                span = int(m.get("minutes", 5)) * 60
+                win = [w for w in windows.get(a["name"], []) if now - w[0] < span]
+                if hits:
+                    win.append([now, sum(r["count"] for r in hits)])
+                windows[a["name"]] = win
+                total = sum(c for _, c in win)
+                if hits and total >= int(m.get("count", 1)):
+                    top = max(hits, key=lambda r: r["count"])
+                    fire(a, a["name"], f"{total} matching entries in {m.get('minutes', 5)} min: {top['template'][:160]}",
+                         source=top["source"], fp=top["fp"], samples=top["samples"][:3], count=total)
+                    windows[a["name"]] = []
+            elif "unit_failed" in a:
+                for u in sorted(failed):
+                    if "*" in a["unit_failed"] or u in a["unit_failed"]:
+                        fire(a, f"{a['name']}:{u}", f"{u} has failed", unit=u)
+            elif a.get("silent"):
+                src, mins = a["silent"]["source"], a["silent"]["minutes"]
+                quiet = now - heard.get(src, now)
+                if quiet >= mins * 60:
+                    fire(a, a["name"], f"{src} has written nothing for {int(quiet // 60)} min", source=src)
+        return out
 
     def inventory(self, versions: dict | None = None) -> dict:
         osr = {}
@@ -1728,10 +1841,15 @@ class Ridge:
                         dest = self.p("inbox", key)
                         os.makedirs(os.path.dirname(dest), exist_ok=True)
                         tmp = dest + ".part"
+                        data = store.get(key)
                         with open(tmp, "wb") as f:
-                            f.write(store.get(key))
+                            f.write(data)
                         os.replace(tmp, dest)
                         got += 1
+                        if kind == "alerts":             # a fleet's alerts reach the person as they arrive
+                            for a in unpack(data):
+                                queue_note(self.cfg, f"{a.get('rule')}: {str(a.get('detail'))[:120]}", alert_body(a),
+                                           a.get("severity", "warn"), "alert")
         if deep:
             st["deep_at"] = iso(t)
         for name in sorted(os.listdir(self.p("outbox"))) if os.path.isdir(self.p("outbox")) else []:
@@ -1759,7 +1877,7 @@ class Ridge:
         edges = read_json(self.p("map", "edges.json"), {})
         tmpls = read_json(self.p("map", "templates.json"), {})
         notes = {"new_hosts": [], "versions": [], "new_edges": [], "new_templates": [], "spikes": [], "answers": [], "errors": 0,
-                 "config": [], "interpreter": [], "discovery": []}
+                 "config": [], "interpreter": [], "discovery": [], "alerts": []}
         for rel in files:
             path = os.path.join(inbox, rel)
             try:
@@ -1775,6 +1893,9 @@ class Ridge:
                     self.merge_flows(edges, r, rel, notes)
                 elif kind == "packets":
                     self.merge_packet(tmpls, r, rel, notes)
+                elif kind == "alerts":
+                    notes["alerts"].append({**r, "file": rel})
+                    append_jsonl(self.p("alerts.jsonl"), r)
                 elif kind == "answers":
                     notes["answers"].append({"host": r.get("host"), "asked": r.get("request"), "file": f"answers/{rel}"})
             done = self.p("archive", rel)
@@ -1860,6 +1981,11 @@ class Ridge:
 
     def digest(self, notes: dict, silent: list[str], n_files: int) -> str:
         parts = []
+        if notes["alerts"]:                          # first: a person has already been told; follow up now
+            parts.append("## Alerts fired (already sent to your person: follow up with what they mean)\n" + "\n".join(
+                f"- **{a.get('rule')}** [{a.get('severity')}] {a.get('host')} {a.get('at')}: {a.get('detail')}"
+                + (f"\n  fp `{a['fp']}`" if a.get("fp") else "") + (f"\n  e.g.: {a['samples'][0][:240]}" if a.get("samples") else "")
+                + f"\n  file: inbox/{a['file']}" for a in notes["alerts"]))
         if notes["new_hosts"]:
             parts.append("## New hosts\n" + "\n".join(f"- {h}" for h in notes["new_hosts"]))
         if silent:
@@ -1989,6 +2115,213 @@ def finding_status(cfg: dict, fid: str, status: str, why: str | None) -> str:
     return f"{fid} {status}"
 
 
+# ---- notify and report: one queue for everything that should reach a person (fired alerts, the reviewer's
+# notes, hobkin's own "I'm paused"), delivered by the plain loop (sendmail or SMTP, capped per hour); and the
+# findings page, rendered from the data folder and copied to a folder a web server already serves
+def notify_dir(cfg: dict, *parts) -> str:
+    return os.path.join(cfg["ridge"]["data"], "notify", *parts)
+
+
+def queue_note(cfg: dict, subject: str, body: str, severity: str = "warn", source: str = "reviewer") -> str:
+    """Queue a note for a person. The reviewer can do this from its sandbox: it only writes the data folder."""
+    t = now_utc()
+    path = notify_dir(cfg, "queue", f"{stamp(t)}_{secrets.token_hex(3)}.json")
+    write_json(path, {"at": iso(t), "subject": subject[:200], "body": body[:20000], "severity": severity,
+                      "source": source, "host": cfg["host"]})
+    return path
+
+
+def alert_body(a: dict) -> str:
+    lines = [f"{a['rule']} ({a['severity']}) on {a['host']} at {a['at']}", "", a["detail"]]
+    if a.get("about"):
+        lines += ["", f"why this rule: {a['about']}"]
+    for k in ("unit", "source", "fp", "count"):
+        if a.get(k) is not None:
+            lines.append(f"{k}: {a[k]}")
+    if a.get("samples"):
+        lines += ["", "samples (redacted):"] + [f"  {x[:500]}" for x in a["samples"]]
+    lines += ["", "The reviewer has been woken and will follow up with what it means."]
+    return "\n".join(lines)
+
+
+def send_mail(conf: dict, subject: str, body: str) -> None:
+    """One email, by sendmail (the box's own mail system) or an SMTP relay. Raises on failure."""
+    import email.message
+    import smtplib
+    msg = email.message.EmailMessage()
+    msg["To"], msg["Subject"] = conf["email"], subject
+    msg["From"] = conf.get("from") or f"eaveswatch@{socket.getfqdn()}"
+    msg.set_content(body)
+    if conf.get("smtp"):
+        host, _, port = conf["smtp"].partition(":")
+        with smtplib.SMTP(host, int(port or 25), timeout=30) as s:
+            s.send_message(msg)
+        return
+    cmd = conf.get("sendmail") or shutil.which("sendmail") or "/usr/sbin/sendmail"
+    r = subprocess.run([cmd, "-t", "-oi"], input=msg.as_bytes(), capture_output=True, timeout=60)
+    if r.returncode:
+        raise OSError(f"{cmd} exited {r.returncode}: {r.stderr.decode(errors='replace')[:300]}")
+
+
+def deliver_notes(cfg: dict) -> tuple[int, int]:
+    """Send what's queued, oldest first, at most notify.per_hour an hour (the rest wait, and the next note says how
+    many are waiting). With no channel set, notes stay in notify/unsent/. Returns (sent, still waiting)."""
+    q = notify_dir(cfg, "queue")
+    names = sorted(n for n in os.listdir(q) if n.endswith(".json")) if os.path.isdir(q) else []
+    if not names:
+        return 0, 0
+    conf = cfg.get("notify") or {}
+    if not conf.get("email"):
+        os.makedirs(notify_dir(cfg, "unsent"), exist_ok=True)
+        for n in names:
+            os.replace(os.path.join(q, n), notify_dir(cfg, "unsent", n))
+        return 0, 0
+    log = notify_dir(cfg, "sent.jsonl")
+    now = time.time()
+    recent = [l for l in _read(log).splitlines() if l.strip() and now - parse_iso(json.loads(l)["at"]).timestamp() < 3600]
+    room, sent = int(conf.get("per_hour", 20)) - len(recent), 0
+    for i, n in enumerate(names):
+        if sent >= room:
+            break
+        note = read_json(os.path.join(q, n), None)
+        if not note:
+            os.remove(os.path.join(q, n))
+            continue
+        waiting = len(names) - i - 1
+        tag = "ALERT" if note.get("severity") == "page" else "eaveswatch"
+        try:
+            send_mail(conf, f"[{tag}] {note['host']}: {note['subject']}",
+                      note["body"] + (f"\n\n({waiting} more notes waiting: the hourly cap is {conf.get('per_hour', 20)})"
+                                      if waiting and sent == room - 1 else "") + f"\n\n-- eaveswatch on {note['host']}, {note['at']}")
+        except Exception as e:                    # smtplib and sendmail fail in their own ways: hold it, say why
+            print(f"eaveswatch: notify: {e}", file=sys.stderr, flush=True)
+            break
+        append_jsonl(log, {"at": iso(now_utc()), "subject": note["subject"], "severity": note.get("severity")})
+        os.makedirs(notify_dir(cfg, "sent"), exist_ok=True)
+        os.replace(os.path.join(q, n), notify_dir(cfg, "sent", n))
+        sent += 1
+    return sent, len(names) - sent
+
+
+def _h(x) -> str:
+    import html
+    return html.escape("" if x is None else str(x))
+
+
+REPORT_CSS = """:root{--bg:#fbfaf7;--fg:#1d1d1b;--muted:#6b6a65;--card:#fff;--line:#e4e1d8;--page:#b3261e;--warn:#8a5a00;--ok:#2f6b3a}
+@media (prefers-color-scheme:dark){:root{--bg:#161614;--fg:#ecebe6;--muted:#9c9a93;--card:#1f1f1c;--line:#34332e;--page:#ff8a80;--warn:#f0b64a;--ok:#7fc48b}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:24px 16px 64px}h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 8px}
+.muted{color:var(--muted)}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:8px 0}
+.tag{display:inline-block;font-size:12px;padding:1px 7px;border-radius:10px;border:1px solid var(--line);margin-right:6px}
+.page{color:var(--page)}.warn{color:var(--warn)}.ok{color:var(--ok)}pre{white-space:pre-wrap;word-break:break-word;font-size:13px;margin:6px 0}
+table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid var(--line);padding:5px 6px;text-align:left;vertical-align:top}
+details>summary{cursor:pointer}dl{margin:6px 0}dt{font-weight:600;font-size:13px;color:var(--muted)}dd{margin:0 0 6px}
+"""
+
+
+def render_report(cfg: dict) -> str:
+    """The findings page: open findings with their evidence, recent alerts, digests, the map, the interpreter.
+    Everything in it is escaped (it shows text from logs, which others write)."""
+    data = cfg["ridge"]["data"]
+    fs = findings(cfg)
+    open_fs = [f for f in fs.values() if f.get("status") in ("open", "accepted", "reopened")]
+    closed = [f for f in fs.values() if f not in open_fs]
+    alerts = [json.loads(l) for l in _read(os.path.join(data, "alerts.jsonl")).splitlines()[-50:] if l.strip()]
+    hosts = read_json(os.path.join(data, "map", "hosts.json"), {})
+    edges = read_json(os.path.join(data, "map", "edges.json"), {})
+    dd = os.path.join(data, "digests")
+    digests = sorted(os.listdir(dd))[-10:] if os.path.isdir(dd) else []
+    spec, v = active_spec(cfg)
+
+    def finding(f, full=True):
+        st = f.get("status")
+        cls = "ok" if st == "fixed" else "muted" if st == "dismissed" else "warn"
+        out = (f'<div class="card"><span class="tag {cls}">{_h(st)}</span><span class="tag">{_h(f.get("category"))}</span>'
+               f'<span class="tag">{_h(str(f.get("confidence") or "").split(":")[0].split()[0] if f.get("confidence") else "?")}</span>'
+               f'<span class="tag">seen {_h(f.get("sightings"))}x</span>'
+               f'<div style="margin:6px 0"><strong>{_h(f.get("claim"))}</strong></div><div class="muted">{_h(f["id"])} at {_h(f.get("location"))}; '
+               f'first {_h(f.get("at"))}{"; last " + _h(f.get("last_seen")) if f.get("last_seen") else ""}</div>')
+        if full:
+            out += "<dl>" + "".join(f"<dt>{k}</dt><dd><pre>{_h(f.get(k))}</pre></dd>" for k in ("evidence", "scenario", "action", "confidence")
+                                     if f.get(k)) + (f"<dt>inputs</dt><dd><pre>{_h(chr(10).join(map(str, f.get('inputs') or [])))}</pre></dd>"
+                                                    if f.get("inputs") else "") + "</dl>"
+            why = [h.get("why") for h in f.get("history") or [] if h.get("why")]
+            if why:
+                out += f'<div class="muted">why: {_h(why[-1])}</div>'
+        return out + "</div>"
+    parts = [f"<h1>eaveswatch: {_h(cfg['host'])}</h1><div class='muted'>env {_h(cfg['env'])} · interpreter "
+             f"{'v' + str(v) if v else 'not set up yet'} · {len(open_fs)} open findings · updated {_h(iso(now_utc()))}</div>"]
+    parts.append("<h2>Open findings</h2>" + ("".join(finding(f) for f in sorted(open_fs, key=lambda f: f.get("at", ""), reverse=True))
+                                             or "<p class='muted'>None open.</p>"))
+    parts.append("<h2>Recent alerts</h2>" + ("<table><tr><th>when</th><th>rule</th><th>host</th><th>what</th></tr>" + "".join(
+        f"<tr><td>{_h(a.get('at'))}</td><td class='{'page' if a.get('severity') == 'page' else 'warn'}'>{_h(a.get('rule'))}</td>"
+        f"<td>{_h(a.get('host'))}</td><td>{_h(a.get('detail'))}</td></tr>" for a in reversed(alerts)) + "</table>"
+        if alerts else "<p class='muted'>None yet.</p>"))
+    parts.append("<h2>Recent digests</h2>" + ("".join(
+        f"<details><summary>{_h(n)}</summary><pre>{_h(_read(os.path.join(dd, n))[:30000])}</pre></details>" for n in reversed(digests))
+        or "<p class='muted'>None yet.</p>"))
+    parts.append("<h2>Hosts</h2><table><tr><th>host</th><th>versions</th><th>last seen</th></tr>" + "".join(
+        f"<tr><td>{_h(h)}</td><td>{_h(', '.join(f'{k} {str(x)[:12]}' for k, x in (r.get('services') or {}).items()))}</td>"
+        f"<td>{_h(r.get('last_seen'))}</td></tr>" for h, r in sorted(hosts.items())) + "</table>"
+        f"<p class='muted'>{len([e for e in edges.values() if e.get('listen')])} listeners and "
+        f"{len([e for e in edges.values() if not e.get('listen')])} connections on the map.</p>")
+    parts.append("<h2>What's collected</h2><ul>" + "".join(
+        f"<li>{_h(s['name'])}: {_h(s.get('path') or ('journald' + (' (user)' if s['journald'].get('user') else '') + ': ' + ', '.join((s['journald'].get('units') or []) + (s['journald'].get('identifiers') or [])) or 'everything'))}"
+        f"{' (archived raw)' if s.get('raw') else ''}</li>"
+        for s in spec.get("sources") or []) + "".join(f"<li>alert <strong>{_h(a['name'])}</strong> ({_h(a.get('severity', 'warn'))})</li>"
+                                                    for a in spec.get("alerts") or []) + "</ul>")
+    if closed:
+        parts.append(f"<h2>Closed findings ({len(closed)})</h2><details><summary>show</summary>"
+                     + "".join(finding(f, False) for f in sorted(closed, key=lambda f: f.get("at", ""), reverse=True)) + "</details>")
+    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>eaveswatch {_h(cfg['host'])}</title><style>{REPORT_CSS}</style></head><body><main>" + "".join(parts)
+            + "</main></body></html>\n")
+
+
+def publish_report(cfg: dict) -> str | None:
+    """Write the findings page to DATA/report/index.html, and to the publish folder if there is one; only when it
+    changed (the time line aside). Returns where it was published, if anywhere."""
+    page = render_report(cfg)
+    body = re.sub(r"updated [0-9TZ:-]+", "", page)
+    h = hashlib.sha256(body.encode()).hexdigest()
+    stamp_file = os.path.join(cfg["ridge"]["data"], "report", ".hash")
+    if _read(stamp_file).strip() == h:
+        return None
+    targets = [os.path.join(cfg["ridge"]["data"], "report")] + ([os.path.expanduser(cfg["publish"]["dir"])]
+                                                                 if (cfg.get("publish") or {}).get("dir") else [])
+    for d in targets:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, f".index.html.{os.getpid()}")
+        with open(tmp, "w") as f:
+            f.write(page)
+        os.replace(tmp, os.path.join(d, "index.html"))
+    with open(stamp_file, "w") as f:
+        f.write(h)
+    return targets[-1]
+
+
+def iam_policy(cfg: dict) -> dict:
+    """The least this role needs from S3, as an IAM policy."""
+    u = urllib.parse.urlsplit(cfg["store"])
+    b, pre = u.netloc, (u.path.strip("/") + "/") if u.path.strip("/") else ""
+    arn = f"arn:aws:s3:::{b}"
+    stmts = [{"Sid": "WriteOwnHost", "Effect": "Allow", "Action": "s3:PutObject", "Resource": f"{arn}/{pre}*/host={cfg['host']}/*"}]
+    if cfg["role"] == "eave":
+        stmts += [{"Sid": "ListAsks", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
+                   "Condition": {"StringLike": {"s3:prefix": f"{pre}env=*/kind=requests/*"}}},
+                  {"Sid": "ReadAsks", "Effect": "Allow", "Action": "s3:GetObject",
+                   "Resource": f"{arn}/{pre}env=*/kind=requests/*/host={cfg['host']}/*"}]
+    if cfg["role"] == "ridge":
+        kinds = [f"{pre}env=*/kind={k}/*" for k in RIDGE_READS]
+        stmts = [{"Sid": "ListWhatItSyncs", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": arn,
+                  "Condition": {"StringLike": {"s3:prefix": kinds}}},
+                 {"Sid": "ReadWhatItSyncs", "Effect": "Allow", "Action": "s3:GetObject", "Resource": [f"{arn}/{k}" for k in kinds]},
+                 {"Sid": "SendAsksAndProbes", "Effect": "Allow", "Action": "s3:PutObject",
+                  "Resource": [f"{arn}/{pre}env=*/kind=requests/*", f"{arn}/{pre}env=*/kind=check/*"]}]
+    return {"Version": "2012-10-17", "Statement": stmts}
+
+
 # ---- the reviewer: a hobkin chore, written out by `eaveswatch chore` (it travels inside this one file)
 CHORE_JSON = {
     "name": "eaveswatch",
@@ -2010,7 +2343,8 @@ CHORE_JSON = {
     "config": {
         "idle_prompt": None,
         "safe_mode": {"write": ["{{data}}"]},
-        "wake": {"command": "{{command}} --config {{config}} ridge watch", "every": "5m"},
+        "wake": {"command": "{{command}} --config {{config}} ridge watch", "every": "1m"},   # silent is free: wake fast
+        "alert_command": "{{command}} --config {{config}} notify",     # notify, and hobkin's own alerts: the person's queue
     },
 }
 
@@ -2040,9 +2374,13 @@ You have two jobs: **keep the interpreter right**, and **review**.
    WebLogic on 8000 ..."), then propose, as a short list they can tick: the
    sources you'd collect and why, which you'd leave out (noise), which config
    files you'd watch for change, where each service's version comes from, and
-   anything you'd archive raw. Ask what *they* care about (sign-ons and lockouts,
-   errors, integration failures, slow requests, config drift...). Give your
-   recommendation for each, so "yes" is a complete answer.
+   anything you'd archive raw, and **what should alert them right away** (a
+   page: a unit failing, an error storm, sign-on failures from one place) versus
+   what can wait for your write-up. Ask what *they* care about (sign-ons and
+   lockouts, errors, integration failures, slow requests, config drift...). Give
+   your recommendation for each, so "yes" is a complete answer. If `check` said
+   the credentials can do far more than this needs, say so here too, with what
+   `{{command}} --config {{config}} iam` prints: the one policy it does need.
 3. **Write the spec.** `{{command}} --config {{config}} interpret init {{data}}/interpreter/draft.json`
    gives you the starting point (generic placeholders and levels). Add:
    - `sources`: `{"name", "path": GLOB}` or `{"name", "journald": {"user": true,
@@ -2055,6 +2393,12 @@ You have two jobs: **keep the interpreter right**, and **review**.
    - `services`: `{"name": {"git": DIR}}` or `{"version": {"file", "pattern"}}`, and
      `"watch": [config globs]` (hashed, never read out).
    - `placeholders`, `redact` (extra patterns: the built-in floor always runs).
+   - `alerts`: what reaches a person at once, checked by plain code every minute:
+     `{"name", "severity": "page"|"warn", "cooldown_minutes": 30, "about": "why", ...}`
+     with one of `"match": {"template": REGEX, "level": "error", "source", "count": N,
+     "minutes": M}` (N matching entries in M minutes), `"unit_failed": ["psappsrv.service"]`
+     (or `["*"]`), `"silent": {"source", "minutes"}` (a source that's gone quiet).
+     Few and sharp: an alert nobody acts on teaches them to ignore the next one.
    Globs, not today's file names: logs that roll by date (`APPSRV_1114.LOG`) need
    `APPSRV_*.LOG`. Credential files and folders (`~/.ssh`, keys, `~/.hobkins`...)
    are refused, whatever you write.
@@ -2079,6 +2423,22 @@ joined. Then:
   dropping noise, fixing a glob. Test, apply with a note, mention it.
 - **Adding is your human's**: a new source, a new raw archive, a new watched file.
   Propose it (what, why, a sample), and apply once they say yes.
+
+## Alerts: the fast path, then you
+
+When a rule fires, the person gets a terse email at once (the eave sends it, not
+you), and your next digest starts with **Alerts fired**. That's your cue to
+follow up **now**, within minutes: read what fired and what's around it (the
+samples, the template's history, a deploy or config change before it, the
+code), then tell them what it means and what to do, in one note:
+
+```sh
+{{command}} --config {{config}} notify --subject "PSAPPSRV down: why" "What happened, what it means, what to do."
+```
+
+Use `--severity page` only when they must act now. One follow-up per alert (or
+per burst of the same one), not a running commentary. A rule that fires and
+means nothing is yours to fix: tighten it, or drop it, and say so.
 
 ## Reviewing: when a digest wakes you
 
@@ -2117,8 +2477,10 @@ JSON
 The same category and location is the same finding (counted again, not
 duplicated). `finding list`; `finding status ID dismissed --why "..."` when your
 human says no (fold the reason into `{{data}}/REVIEW.md`, your charter of what
-matters here and what's accepted), `accepted`, `fixed`. Tell people about new
-findings where they look, one per message, the claim first.
+matters here and what's accepted), `accepted`, `fixed`. The findings page
+(`{{data}}/report/index.html`, and the web folder the person gave at setup) updates
+by itself. Tell the person about each new finding with `notify`: the claim first,
+one per note.
 
 A gap in what you can see (an unlogged auth path, a service without a version)
 is a finding too, category `visibility`, with the change that would show it.
@@ -2227,6 +2589,11 @@ def check_store(c: Check, cfg: dict, store, role: str) -> None:
                         c.ok(f"store: {env}/{kind}", f"{len(keys)} files this hour, read the newest")
                 else:
                     c.info(f"store: {env}/{kind}", "listed; nothing this hour yet (is an eave running?)")
+    if isinstance(store, S3Store) and role in ("eave", "finial"):
+        seen = list_buckets(store.region, store.endpoint)
+        if seen:
+            c.warn("credentials", f"they can list every bucket ({len(seen)}): far more than a {role} needs. "
+                   f"`eaveswatch iam` prints the one policy it does need; give the instance that instead")
     if isinstance(store, S3Store) and store.last_date:
         try:
             skew = (now_utc() - dt.datetime.strptime(store.last_date, "%a, %d %b %Y %H:%M:%S GMT")
@@ -2348,6 +2715,31 @@ def run_check(cfg: dict, path: str | None, store=None) -> tuple[str, int]:
         c.info("units", f"{len(uu)} user units running")
         if role == "finial" and not uu and not os.environ.get("XDG_RUNTIME_DIR"):
             c.warn("units", "no user systemd here (XDG_RUNTIME_DIR unset): run as the services' user, with lingering on")
+    n = cfg.get("notify") or {}
+    if role in ("finial", "ridge"):
+        if not n.get("email"):
+            c.warn("alerts", "no notify channel: alerts and the reviewer's notes are kept in the data folder, not sent")
+        elif n.get("smtp"):
+            host, _, port = n["smtp"].partition(":")
+            try:
+                socket.create_connection((host, int(port or 25)), timeout=5).close()
+                c.ok("alerts", f"to {n['email']} by SMTP {n['smtp']}")
+            except OSError as e:
+                c.fail("alerts", f"can't reach the SMTP relay {n['smtp']} ({e})", "check the host and port, or use sendmail")
+        else:
+            sm = n.get("sendmail") or shutil.which("sendmail") or ("/usr/sbin/sendmail" if os.path.exists("/usr/sbin/sendmail") else None)
+            if sm and os.access(sm, os.X_OK):
+                c.ok("alerts", f"to {n['email']} by {sm} (`eaveswatch notify --test` sends one)")
+            else:
+                c.fail("alerts", "no sendmail on this box", "install a mail system (dnf install postfix), or set \"smtp\": \"relay:25\"")
+        pd = (cfg.get("publish") or {}).get("dir")
+        if pd:
+            pd = os.path.expanduser(pd)
+            (c.ok if os.path.isdir(pd) and os.access(pd, os.W_OK) else c.fail)(
+                "findings page", f"{pd}" + ("" if os.path.isdir(pd) and os.access(pd, os.W_OK) else " isn't a folder this user can write"),
+                *([] if os.path.isdir(pd) and os.access(pd, os.W_OK) else ["create it, or give this user write access"]))
+        else:
+            c.info("findings page", f"{cfg['ridge']['data']}/report/index.html (no publish folder set)")
     out = [f"eaveswatch check: {role} {cfg['host']}, env {cfg['env']}, store {cfg['store']}"] + c.lines
     if preview["templates"]:
         out.append(f"\npreview: the recent lines of each source as templates (read here, sent nowhere); "
@@ -2398,17 +2790,19 @@ def bucket_region(bucket: str) -> str | None:
         return None
 
 
-def list_buckets(region: str) -> list[str]:
-    """The buckets these credentials can see (to offer at setup); [] if they can't list them."""
+def list_buckets(region: str, endpoint: str | None = None) -> list[str]:
+    """The buckets these credentials can see (to offer at setup, and to notice credentials broader than needed);
+    [] if they can't list them."""
     try:
         creds = Credentials()
         key_id, secret, token = creds.get()
-        host = f"s3.{region}.amazonaws.com"
+        u = urllib.parse.urlsplit(endpoint) if endpoint else None
+        host = u.netloc if u else f"s3.{region}.amazonaws.com"
         amz = stamp(now_utc())
         payload = hashlib.sha256(b"").hexdigest()
         h = {"host": host, "x-amz-date": amz, "x-amz-content-sha256": payload, **({"x-amz-security-token": token} if token else {})}
         h["Authorization"] = sign_v4("GET", host, "/", {}, h, payload, region, "s3", key_id, secret, amz)
-        req = urllib.request.Request(f"https://{host}/", headers={k: v for k, v in h.items() if k != "host"})
+        req = urllib.request.Request(f"{u.scheme if u else 'https'}://{host}/", headers={k: v for k, v in h.items() if k != "host"})
         body = urllib.request.urlopen(req, timeout=15).read().decode()
         return re.findall(r"<Name>([^<]+)</Name>", body)
     except (OSError, urllib.error.URLError, ValueError, KeyError, IndexError):
@@ -2439,9 +2833,13 @@ def setup(argv: list[str]) -> None:
     ap.add_argument("--host")
     ap.add_argument("--no-service", action="store_true", help="don't install user services (run them yourself)")
     ap.add_argument("--no-chat", action="store_true", help="don't open a chat with the reviewer at the end")
+    ap.add_argument("--alert-email", help="where alerts and the reviewer's notes go (asked for if not given)")
+    ap.add_argument("--smtp", help="send through this SMTP relay (host:port) instead of the box's sendmail")
+    ap.add_argument("--publish-dir", help="a folder a web server already serves, for the findings page (asked for)")
     ap.add_argument("--force", action="store_true", help="replace an existing config or unit")
     a = ap.parse_args(argv)
     cfg_path = os.path.expanduser(SETUP_CONFIG)
+    asking = sys.stdin.isatty()
     hob = hobkin_cmd()
     if not hob:
         sys.exit("eaveswatch: the reviewer runs on hobkin, which isn't installed: pipx install hobkin-eaveswatch "
@@ -2470,13 +2868,55 @@ def setup(argv: list[str]) -> None:
             sys.exit(f"eaveswatch: {cfg_path} already sets up {old.get('store')}; --force replaces it")
         write_json(cfg_path, user)
         print(f"wrote {cfg_path}: finial, store {store}" + (f" ({region})" if region else ""))
+    # Two questions for the person: where alerts go, and whether a web server here can show the findings page.
+    # Asked once (a later run keeps the answers; a flag changes one)
+    user = read_json(cfg_path, {})
+    changed = False
+    if a.alert_email or a.smtp or ("notify" not in user and asking):
+        email = a.alert_email or (user.get("notify") or {}).get("email")
+        if not email and asking:
+            email = input("Where should alerts go? An email address (blank: keep them in the data folder for now): ").strip()
+        if email:
+            n = {"email": email}
+            if a.smtp:
+                n["smtp"] = a.smtp
+            elif not (shutil.which("sendmail") or os.path.exists("/usr/sbin/sendmail")):
+                relay = input("There's no sendmail here. An SMTP relay to send through, host[:port] "
+                              "(blank: keep them for now): ").strip() if asking else ""
+                if relay:
+                    n["smtp"] = relay
+            user["notify"], changed = n, True
+        elif asking:
+            user["notify"], changed = None, True       # asked, and the answer was "not yet"
+    if a.publish_dir or ("publish" not in user and asking):
+        pd = a.publish_dir
+        if not pd and asking:
+            pd = input("Is there a folder a web server here already serves, for the findings page? Its path "
+                       f"(blank: none; it's in {SETUP_STATE}/ridge/report either way): ").strip()
+        if pd:
+            print("  note: anyone who can reach that site sees the findings (redacted log samples, hosts, ports, versions)")
+            user["publish"], changed = {"dir": pd}, True
+        elif asking:
+            user["publish"], changed = None, True
+    if changed:
+        write_json(cfg_path, user)
+        print(f"alerts: {(user.get('notify') or {}).get('email') or 'kept in the data folder'}; findings page: "
+              f"{(user.get('publish') or {}).get('dir') or SETUP_STATE + '/ridge/report'}")
     cfg = load_config(cfg_path)
     os.makedirs(cfg["ridge"]["data"], exist_ok=True)       # the reviewer's write folder must exist before it starts
     text, problems = run_check(cfg, cfg_path)
     if problems:
         print(text)
         sys.exit("eaveswatch: fix what check says, then run this again")
-    print("check: all good (store, credentials, clock)")
+    print("check: all good (store, credentials, clock" + (", alerts" if (cfg.get("notify") or {}).get("email") else "") + ")")
+    for line in text.splitlines():
+        if line.startswith("  warn"):
+            print(line)
+    if (cfg.get("notify") or {}).get("email") and asking and \
+            input(f"Send a test email to {cfg['notify']['email']} now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        queue_note(cfg, "test note", "eaveswatch can reach you. Alerts and the reviewer's notes come this way.", "warn", "test")
+        sent, _ = deliver_notes(cfg)
+        print("  sent: check your inbox (and spam)" if sent else "  not sent: see the error above")
     cmd = eaveswatch_cmd()
     if a.no_service:
         print(f"not installing services: run `{cmd} --config {cfg_path} finial` yourself")
@@ -2555,6 +2995,12 @@ def cli(argv: list[str] | None = None) -> None:
     f.add_argument("--why")
     f.add_argument("--all", action="store_true")
     sub.add_parser("check")
+    sub.add_parser("iam")
+    nt = sub.add_parser("notify")
+    nt.add_argument("text", nargs="*")
+    nt.add_argument("--subject")
+    nt.add_argument("--severity", choices=("page", "warn"), default="warn")
+    nt.add_argument("--test", action="store_true", help="send a test note now")
     c = sub.add_parser("chore")
     c.add_argument("dest", nargs="?")
     c.add_argument("--force", action="store_true")
@@ -2580,6 +3026,23 @@ def cli(argv: list[str] | None = None) -> None:
         text, problems = run_check(cfg, args.config)
         print(text)
         sys.exit(1 if problems else 0)
+    if args.cmd == "iam":
+        print(json.dumps(iam_policy(cfg), indent=2))
+        return
+    if args.cmd == "notify":
+        if args.test:
+            queue_note(cfg, "test note", "eaveswatch can reach you. Alerts and the reviewer's notes come this way.", "warn", "test")
+            sent, left = deliver_notes(cfg)
+            print(f"sent {sent} to {(cfg.get('notify') or {}).get('email')}" if sent else
+                  "not sent: " + ("no notify channel in the config" if not (cfg.get("notify") or {}).get("email") else
+                                  f"{left} waiting (see the error above)"))
+            sys.exit(0 if sent else 1)
+        text = " ".join(args.text) or os.environ.get("HOBKIN_ALERT") or ("" if sys.stdin.isatty() else sys.stdin.read())
+        if not text.strip():
+            sys.exit("eaveswatch: notify TEXT (or $HOBKIN_ALERT, or text on stdin)")
+        subject = args.subject or text.strip().splitlines()[0][:120]
+        print(f"queued: {queue_note(cfg, subject, text.strip(), args.severity, 'reviewer')} (sent by the loop within a minute)")
+        return
     if args.cmd == "key":
         print(object_key(cfg["env"], args.kind, safe_name(args.host or cfg["host"]), now_utc()))
     elif args.cmd == "eave":
@@ -2603,7 +3066,11 @@ def cli(argv: list[str] | None = None) -> None:
         def finial_tick():
             e.tick()
             sent, left = e.last_flush
-            msg = []
+            notes, _ = deliver_notes(cfg)
+            published = publish_report(cfg)
+            msg = [f"notes sent: {notes}"] if notes and args.once else []
+            if published and args.once:
+                msg.append(f"findings page: {published}/index.html")
             if time.time() - last["discover"] >= cfg["discover_every"]:
                 _, ch = run_discovery(cfg)
                 last["discover"] = time.time()
@@ -2623,8 +3090,10 @@ def cli(argv: list[str] | None = None) -> None:
                 print(out)
         elif args.action == "sync" or args.once:
             print(f"{rd.sync()} new files", file=sys.stderr)
+            deliver_notes(cfg)
+            publish_report(cfg)
         else:
-            loop(cfg, False, lambda: (rd.sync(), "")[1])
+            loop(cfg, False, lambda: (rd.sync(), deliver_notes(cfg), publish_report(cfg), "")[-1])
     elif args.cmd == "discover":
         r, ch = run_discovery(cfg)
         print(json.dumps(r, indent=1) if args.json else discovery_text(r)

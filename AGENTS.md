@@ -19,6 +19,11 @@
 - **The reviewer has no credentials and no network.** `ridge sync` (the plain loop) talks to the store;
   `ridge watch` and everything the hobkin runs read and write only the ridge's data folder. Asks to eaves are
   a fixed menu (`lines`, `inventory`, `flows`): never add one that runs a command it's given.
+- **People are reached through one queue** (`DATA/notify/queue/`), sent by the plain loop (sendmail or SMTP,
+  capped per hour): fired alerts, the reviewer's notes, hobkin's own alerts. The reviewer only writes the queue
+  (it has no network). Alert rules are spec data checked by plain code each tick, never a model call.
+- **The findings page is static HTML** written by the loop to `DATA/report/` and an optional publish folder that
+  another server already serves. eaveswatch itself serves nothing. Escape everything in it: it shows log text.
 - **Quiet is free:** `ridge watch` prints nothing when there's nothing new, so a hobkin's wake costs no model
   call. Don't make it chatty.
 - **The reviewer's instructions** are a hobkin chore kept inside the file (`CHORE_JSON`, `CHORE_MD`), so a
