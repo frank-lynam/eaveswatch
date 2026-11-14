@@ -29,7 +29,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-hobkin = ["hobkin>=0.5.6"]   # the reviewer harness eaveswatch is designed for
+hobkin = ["hobkin>=0.5.7"]   # the reviewer harness eaveswatch is designed for
 
 [project.urls]
 Homepage = "https://github.com/frank-lynam/eaveswatch"
