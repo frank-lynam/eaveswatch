@@ -1,0 +1,17 @@
+# ~/.config/systemd/user/eaveswatch-finial.service: a USER unit, as the same user the watched services run as
+# (that's what lets discovery see their open logs, sockets and environment). Then:
+#   systemctl --user daemon-reload && systemctl --user enable --now eaveswatch-finial
+#   loginctl enable-linger $USER      # once (an admin may need to): user units keep running with nobody logged in
+[Unit]
+Description=eaveswatch finial: this box's logs, interpreted, to S3 and the reviewer
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/eaveswatch --config %h/.config/eaveswatch/finial.json finial
+# S3 credentials: the instance role needs nothing here; otherwise AWS_ACCESS_KEY_ID=... in this file (mode 600)
+EnvironmentFile=-%h/.config/eaveswatch/aws.env
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

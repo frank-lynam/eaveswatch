@@ -3,13 +3,19 @@
 - **One file, standard library only:** `eaveswatch.py`, Python 3.9+. No third-party packages (no boto3:
   SigV4 is signed by hand), no listening ports, no build step. `grep -n '^# ----' eaveswatch.py` lists its
   sections; new code goes in the section it belongs to, and the map at the top stays in step.
-- **Same module everywhere:** roles (`eave`, `ridge`, `local`) are config, not forks. A ridge can be an eave
+- **Same module everywhere:** roles (`eave`, `ridge`, `finial`) are config, not forks. A ridge can be an eave
   of a bigger ridge; keep that true.
+- **No baked-in log rules.** What to collect and how to read it is the interpreter spec (data, written by the
+  reviewer from `discover` and its human, checked by `interpret test`). The code runs patterns; it never runs code
+  from a spec. The starter spec is a starting point, not a rule set. Config stays plumbing only.
+- **The redaction floor (`REDACT`) and the credential deny-list (`DENY_PATHS`, `DENY_NAMES`) are the exception:**
+  always on, and a spec can only add to them. Never make either configurable away.
 - **The store layout is a contract** (Athena tables and IAM policies are written against it):
   `PREFIX/env=/kind=/dt=YYYY-MM-DD/hour=HH/host=/HOST_STAMP_RAND.jsonl.gz`, gzipped JSON lines. Change it only
   on purpose, with the README.
-- **Nothing leaves a host unredacted.** Redaction runs before templating, samples, raw and answers. A new
-  output path goes through `self.redact` too.
+- **Nothing leaves a host unredacted.** Redaction runs before templating, samples, raw, answers and discovery
+  samples. A new output path goes through the interpreter's `redact` too. Discovery lists config files, never
+  reads them out; watched files are hashed, never sent.
 - **The reviewer has no credentials and no network.** `ridge sync` (the plain loop) talks to the store;
   `ridge watch` and everything the hobkin runs read and write only the ridge's data folder. Asks to eaves are
   a fixed menu (`lines`, `inventory`, `flows`): never add one that runs a command it's given.

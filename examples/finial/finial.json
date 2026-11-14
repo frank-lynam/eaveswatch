@@ -1,0 +1,10 @@
+{
+  "role": "finial",
+  "env": "prod",
+  "host": "ps-hr-01",
+  "store": "s3://my-eaves-bucket/eaveswatch",
+  "region": "us-east-1",
+  "state_dir": "~/eaveswatch",
+  "every": 60,
+  "discover_every": 3600
+}

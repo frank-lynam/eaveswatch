@@ -1,28 +1,121 @@
 # hobkin-eaveswatch
 
-Logs, deploys and connections from every host, joined to the code that made
-them, for a [hobkin](https://github.com/frank-lynam/hobkin) to review.
+Logs, deploys, config and connections, joined to the code that made them, for a
+[hobkin](https://github.com/frank-lynam/hobkin) to set up and review.
 
 Scanners look at one thing at a time: a diff, a dependency, a log line. The
-interesting problems are joins: *this commit changed the retry, and since
-Tuesday's deploy that error is 40× an hour from that code path*; *flow data
-shows web-3 talking to the admin DB, and nothing in the code says it should*.
-eaveswatch gathers what's needed to see those, and hands it to a reviewer
-agent with a bar for what counts as a finding and a ledger that traces every
-conclusion back to its evidence.
+interesting problems are joins: *since Tuesday's config change that error is
+40× an hour*; *the box listens on a port nobody mentioned*. eaveswatch gathers
+what's needed to see those and hands it to a reviewer agent. The agent works
+out what's worth collecting and how to read it. It gets a bar for what counts as
+a finding, and a ledger that traces every conclusion back to its evidence.
 
-- **Eaves** run on every host. No model, no key. They read log files and
-  journald, redact secrets **on the host**, and turn lines into templates with
-  counts (flagging new and spiking ones against the host's own baseline). They
-  note what's deployed (the git SHA of each service, units, containers) and
-  who the host talks to (`ss`). Everything goes to the store as gzipped JSON lines.
-- **The ridge** is the hub: a plain loop pulls new files from the store into a
-  data folder. Then a hobkin with the `eaveswatch` chore wakes on a digest of
-  what's new, keeps the system map, connects log lines to the code at the
-  version that wrote them, and records findings.
-- **Same module everywhere.** One stdlib-only Python file (3.9+), three roles:
-  `eave`, `ridge`, `local` (both on one box, with a folder for a store). A
-  ridge can be an eave of a bigger roof.
+- **No hand-written log config.** The reviewer hobkin runs `discover`:
+  - which services run here, and what they run
+  - which files each one has open for writing
+  - which ports they listen on and talk to
+  - which config files they point at
+  - who writes to the journal
+
+  It asks you what you care about, then writes an **interpreter spec**: JSON
+  that names the sources and says how to read them. That means multi-line
+  entries, timestamps, levels, placeholders for what varies, noise to drop,
+  where versions come from, and which config files to watch. `interpret test`
+  replays the real recent lines through it; `interpret apply` makes it the
+  active, numbered version.
+- **No model per line, and no code from the model.** The eave runs the active
+  spec's patterns in plain code. Patterns that backtrack forever are caught in
+  testing.
+- **Secrets never leave**, whatever the spec says. A built-in redaction floor
+  always runs first. It catches private keys, AWS key ids, JWTs, bearer
+  tokens, `password=`/`token=` values, `PS_TOKEN`/`JSESSIONID`, `user:pass@`
+  in URLs and long base64 blobs. A spec can add patterns but never remove
+  them. Credential files and folders (`~/.ssh`, `~/.aws`, key files,
+  `~/.hobkins`...) are refused as sources.
+- **Same module everywhere**, one standard-library Python file (3.9+), three roles:
+
+| Role | Where | What |
+|---|---|---|
+| `finial` | one box, all of it | eave, ridge and reviewer together; files to S3 (the archive) and straight to the reviewer |
+| `eave` | every host of a fleet | its interpreter's sources, inventory, flows → the store; answers asks |
+| `ridge` | a fleet's hub | the store → a data folder for the reviewer; asks → the store |
+
+(A finial is the ornament at the very top of a single roof.)
+
+## A finial: one box, watched from the inside
+
+Run it as **the same user the watched services run as**, with those services as
+user systemd units. Linux lets that user see its own processes' open files,
+sockets and environment, so discovery needs no root and no extra
+capabilities.
+
+```sh
+pipx install hobkin-eaveswatch                     # or copy eaveswatch.py to ~/.local/bin/eaveswatch
+mkdir -p ~/.config/eaveswatch
+cp examples/finial/finial.json ~/.config/eaveswatch/                 # set the bucket, region, host name
+eaveswatch --config ~/.config/eaveswatch/finial.json check           # store, credentials, clock: fix what it says
+cp examples/finial/eaveswatch-finial.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now eaveswatch-finial
+loginctl enable-linger "$USER"                     # once: user units run with nobody logged in
+
+eaveswatch chore                                   # the reviewer chore, with this eaveswatch's full path
+hobkin URL MODEL KEY --chore eaveswatch --id eaveswatch --safe --chat \
+  --set config=~/.config/eaveswatch/finial.json --set data=~/eaveswatch/ridge
+```
+
+The data folder isn't under a dot-folder on purpose: hobkin's safe mode
+refuses write folders inside `~/.something`, because those are ways out of the
+sandbox. Start the finial before the hobkin; its first tick creates the folder.
+
+The reviewer then:
+1. runs `discover`
+2. tells you in a few lines what it found ("a PeopleSoft app server domain
+   HRDEV, a PIA on 8000...")
+3. proposes what to collect, watch and archive, with a recommendation for each
+4. asks what you care about
+5. writes, tests and applies the interpreter, and tells you what's now collected
+
+Discovery runs again every hour. What changed (new units, programs,
+listeners, logs written but not collected) comes in its digest. It fixes and
+narrows the interpreter on its own, and asks you before adding a source.
+
+IAM for a finial is one permission: `s3:PutObject` on `PREFIX/*/host=HOST/*`
+([examples/iam/finial.json](examples/iam/finial.json)).
+
+## The interpreter
+
+```json
+{"sources": [
+   {"name": "appsrv", "path": "/home/psadm2/psft/pt/8.60/appserv/HRDEV/LOGS/APPSRV_*.LOG", "service": "hr-app",
+    "multiline": {"start": "^PSAPPSRV\\.\\d+ "}, "placeholders": [{"name": "sql", "pattern": "'[^']*'"}]},
+   {"name": "pia", "path": "/home/psadm2/psft/pt/8.60/webserv/peoplesoft/servers/PIA/logs/PIA_weblogic.log",
+    "multiline": {"start": "^####<"}, "level": {"pattern": "^####<[^>]*> <(\\w+)>", "map": {"error": "error", "warning": "warn"}},
+    "timestamp": {"pattern": "^####<(\\w{3} \\d{1,2}, \\d{4} \\d{1,2}:\\d\\d:\\d\\d,\\d+ [AP]M)", "format": "%b %d, %Y %I:%M:%S,%f %p"}},
+   {"name": "units", "journald": {"user": true, "units": ["psappsrv.service", "pia.service"]}}],
+ "services": {"hr-app": {"version": {"file": "/home/psadm2/psft/pt/8.60/peopletools.properties", "pattern": "^toolsrelease=(\\S+)"},
+                         "watch": ["/home/psadm2/psft/pt/8.60/appserv/HRDEV/psappsrv.cfg"]}}}
+```
+
+That's the kind of spec a reviewer writes. None of it ships in eaveswatch.
+`interpret init` starts from generic placeholders (times, ids, addresses,
+numbers, quoted strings) and levels, and the reviewer adds the rest:
+
+| Field | What it does |
+|---|---|
+| `sources` | `path` (a glob, so date-rolled logs are followed) or `journald` (`user`, `units`, `identifiers`) |
+| per source | `service`, `multiline.start`, `timestamp` (pattern + strptime format), `level` (pattern + map), `placeholders`, `drop`/`keep`, `raw` (archive redacted entries), `from_start` |
+| `services` | `git` (a checkout's commit) or `version` (`file` + `pattern`), and `watch`: config files hashed (never read out); a change shows in the digest |
+| top level | `placeholders`, `level`, `redact` (extra patterns), `watch`, `spike`, `warmup_minutes`, `max_template`, `max_samples` |
+
+```sh
+eaveswatch interpret init FILE      # the starter
+eaveswatch interpret test FILE      # real recent lines through it: entries, templates, timestamps, slow patterns
+eaveswatch interpret apply FILE --note "why"     # the next version, active on the eave's next tick
+eaveswatch interpret show | rollback [N]
+```
+
+A source's first read starts from the end of what's already there. A file
+that appears later, like tomorrow's `APPSRV_1115.LOG`, is read from its start.
 
 ## The store
 
@@ -30,128 +123,63 @@ A folder, or `s3://bucket/prefix`. Hive-style prefixes, so Athena and Glue can
 query the archive as it is:
 
 ```
-PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=web-3/web-3_20261114T091502Z_7f3a.jsonl.gz
+PREFIX/env=prod/kind=packets/dt=2026-11-14/hour=09/host=ps-hr-01/ps-hr-01_20261114T091502Z_7f3a.jsonl.gz
 ```
 
-- **Time before host:** the ridge lists one hour across every host. IAM can
-  still hold each eave to its own host (`*/host=web-3/*`).
-- **The name stands alone:** host, UTC stamp (sorts as text, no colons), a
-  random suffix so two writes in one second never collide.
-- **Kinds:** `packets` (templates, counts, new and spiking), `inventory`,
-  `flows`, `raw` (opt-in per source: redacted lines, the archive), `requests`
-  (ridge → eave) and `answers` (eave → ridge).
-- **Nothing is lost when the store is away.** An eave writes every file to
-  its spool (`STATE_DIR/spool/`) and saves its place in the logs only after
-  that. It then sends the spool oldest first, deleting each file once it's
-  stored. While S3 is unreachable the spool grows and inventory reports it.
-  Past `spool_max_mb` the oldest `raw` files are dropped first, then the
-  oldest of anything. Once the store is back, the eave sends one error-level
-  packet saying how many were dropped, so the gap shows up in a digest.
-  Delivery is at least once: a crash between spooling and saving sends a few
-  lines twice.
-- **Late files keep their hour.** A spooled file lands in the hour it was
-  made. Every `late_every` seconds the ridge looks back `late_hours`, and
-  anything already in its data folder counts as fetched.
-- **Retention** is S3 lifecycle rules (say, `kind=raw` to Glacier after 30
-  days), not code.
-
-No boto3: requests are signed with SigV4 in the standard library. Credentials
-come from the environment, `~/.aws/credentials` (`AWS_PROFILE`), the ECS task
-role, or the instance role (IMDSv2). `"endpoint"` points it at MinIO or
-another S3-compatible store.
-
-## Try it on one box
-
-```sh
-cat > eaveswatch.json <<'EOF'
-{"role": "local", "env": "dev", "store": "~/eaveswatch/store", "state_dir": "~/eaveswatch/state",
- "sources": [{"name": "journal", "journald": true}],
- "services": {"myapp": {"dir": "~/src/myapp"}}}
-EOF
-python3 eaveswatch.py local --once        # an eave tick and a ridge sync
-python3 eaveswatch.py ridge watch         # the digest: what's new (nothing new: prints nothing)
-```
-
-An eave spends its first hour (`warmup_minutes`) learning what's usual, so
-nothing is flagged "new" until then.
-
-## Check a host
-
-```sh
-eaveswatch --config /etc/eaveswatch.json check      # run it as the service's user: sudo -u eaveswatch ...
-```
-
-It checks what this role does in production, no more:
-- **An eave:** writes a probe under its own host, and lists its asks.
-- **A ridge:** lists and reads every kind it syncs.
-
-It also says where the credentials came from (the key masked), how far this
-clock is from S3's (S3 refuses requests more than 15 minutes off), whether
-every source is readable (journald group membership included), and whether
-every service's version resolves. Each failure comes with its fix: S3's own
-reason ("403 AccessDenied") and the exact permission to add. Then it shows a
-preview of the recent lines as templates, with how many values it redacted.
-That's how you check secrets are caught before anything is sent. The exit
-code is 1 if anything failed, for deploy scripts. Probes go to `kind=check`,
-which nothing reads: a lifecycle rule can expire it after a day.
+- **Time before host:** the ridge lists one hour across every host, and IAM
+  can still hold each host to its own prefix (`*/host=web-3/*`).
+- **The name stands alone:** host, UTC stamp (sorts as text), a random suffix.
+- **Kinds:**
+  - `packets`: templates, counts, samples, new and spiking
+  - `inventory`: versions, watched-file hashes, units, the interpreter version, the spool
+  - `flows`
+  - `raw`: redacted entries of sources marked `raw`, which is the archive
+  - `requests` and `answers`: asks
+  - `check`: probes, which a lifecycle rule can expire
+- **Nothing is lost when the store is away.** Every file is spooled to disk
+  before the eave saves its place in the logs, then sent oldest first. Past
+  `spool_max_mb` the oldest `raw` files go first, and the gap is reported
+  once the store is back. Delivery is at least once.
+- **Late files keep their hour.** Every `late_every` seconds the ridge looks
+  back `late_hours`.
+- No boto3: SigV4 is signed in the standard library. Credentials come from the
+  environment, `~/.aws/credentials`, the ECS task role or the instance role.
 
 ## A fleet
 
-On every host: copy `eaveswatch.py` to `/usr/local/bin/eaveswatch` (or `pipx
-install hobkin-eaveswatch`), write `/etc/eaveswatch.json` (see
-[examples/eave.json](examples/eave.json)), and run
-[examples/eaveswatch-eave.service](examples/eaveswatch-eave.service), as a user
-that can read the logs and nothing else.
-
-On the ridge, two pieces, deliberately apart:
-
-1. **The sync loop**, with the store's credentials and no model:
-   `eaveswatch --config /etc/eaveswatch.json ridge` (the same unit, `ridge`
-   for `eave`; see [examples/ridge.json](examples/ridge.json)).
-2. **The reviewer**, a hobkin with no store credentials and no network for its
-   commands (safe mode). It only reads the data folder:
-
-   ```sh
-   eaveswatch chore                      # writes the chore to ~/.hobkins/_shared/chores/eaveswatch
-   hobkin --chore eaveswatch --set config=/etc/eaveswatch.json \
-     --set data=/srv/eaveswatch-ridge --set repos="/srv/code" --id eaveswatch --safe
-   ```
-
-   Start the sync loop first: it creates the data folder, and safe mode
-   won't start an agent whose write folder doesn't exist yet.
-   Its watch runs `eaveswatch ridge watch` every 5 minutes and wakes it only
-   when there's a digest. Quiet periods cost no model calls.
-
-### IAM, least privilege
-
-| Who | Allow |
-|---|---|
-| eave `web-3` | `s3:PutObject` on `PREFIX/*/host=web-3/*` (its data, answers and `check` probes); `s3:ListBucket` with `s3:prefix` `PREFIX/env=prod/kind=requests/*`; `s3:GetObject` on `PREFIX/env=*/kind=requests/*/host=web-3/*` |
-| ridge sync | `s3:ListBucket` and `s3:GetObject` on `kind=packets`, `inventory`, `flows`, `answers`; `s3:PutObject` on `kind=requests` and `kind=check` |
-| ridge, never | `kind=raw` (the archive is for people; the reviewer asks an eave for lines instead) |
+Every host runs an eave ([examples/fleet/](examples/fleet/)): plumbing-only
+config, with its interpreter in `STATE_DIR/interpreter`. The hub runs the ridge
+sync loop with the store's credentials, and the reviewer hobkin has none:
+`ridge watch` and every command it runs read and write only the ridge's data
+folder. IAM: [examples/iam/eave.json](examples/iam/eave.json) and
+[examples/iam/ridge.json](examples/iam/ridge.json). The ridge never gets
+`kind=raw`.
 
 ## What the reviewer does
 
-The chore's instructions (`CHORE_MD` in `eaveswatch.py`; `eaveswatch chore` writes them out) say it all. In short:
+The chore's instructions (`CHORE_MD` in `eaveswatch.py`; `eaveswatch chore`
+writes them out) cover setting up, keeping the interpreter right, and
+reviewing:
 
-- **The map** (`DATA/map/`) builds itself from eave reports: `hosts.json`
-  (what runs where, at which version, last seen), `edges.json` (listeners,
-  and who talks to whom), `templates.json` (every log template, its hosts and
-  versions). Packets carry the `service` and `version` that wrote each line,
-  so a log line points straight at the code.
-- **The digest** says what changed: new hosts, hosts gone quiet, deploys,
-  new connections and listeners, spiking and new log templates, answers to asks.
-- **Asks** go to an eave from a fixed menu, never a shell: `eaveswatch ask
-  HOST lines FP` (matching lines from its logs, redacted), `ask HOST
-  inventory`, `ask HOST flows`. The answer comes back in a later digest.
+- **The map** (`DATA/map/`): hosts (what runs, versions, watched hashes), edges
+  (listeners and who talks to whom), templates (hosts, versions, totals).
+- **The digest** says what changed:
+  - new hosts, and hosts gone quiet
+  - deploys
+  - config changes and interpreter versions
+  - what changed on the box (from discovery)
+  - new connections
+  - spiking and new templates
+  - answers to its asks
+- **Asks** go to an eave from a fixed menu, never a shell: `ask HOST lines FP`,
+  `ask HOST inventory`, `ask HOST flows`.
 - **A finding** needs evidence, a failure scenario, an action and a
-  confidence. Without all four it's an observation in the agent's notes.
-  Before recording, it gets a brownie to try to knock the finding down, and
-  it records at most three per digest.
-- **The ledger** (`DATA/findings.jsonl`) is append-only events. The same
-  category and location is the same finding (counted again, not duplicated).
-  A dismissal needs a reason, and isn't recorded again. Each finding carries
-  its inputs (store files) and the charter version (`DATA/REVIEW.md`).
+  confidence. Without all four it's an observation. Before recording one, a
+  brownie tries to knock it down; at most three are recorded per digest.
+- **The ledger** (`DATA/findings.jsonl`) is append-only. The same category and
+  location is the same finding (counted again, not duplicated), a dismissal
+  needs a reason and isn't recorded again, and each finding carries its
+  inputs and the charter version.
 
 ```sh
 eaveswatch finding add < finding.json
@@ -159,48 +187,49 @@ eaveswatch finding list [--all]
 eaveswatch finding status F-1a2b3c4d dismissed --why "behind the VPN only"
 ```
 
-- **Visibility gaps are findings too** (category `visibility`): a host with no
-  eave, logs without a version, an auth path that logs nothing. Each comes
-  with the exact change as a reviewable diff. The reviewer never applies those
-  changes itself.
+## Check a box
 
-## Security model
+`eaveswatch --config FILE check`, as the service's user, tests exactly what
+its role does:
+- **eave:** writes under its own host and lists its asks
+- **ridge:** lists and reads what it syncs
+- **finial:** only writes
 
-- Secrets are redacted on the host before anything is written: private keys,
-  AWS key ids, JWTs, bearer tokens, `password=`/`token=`/`api_key=` values,
-  `user:pass@` in URLs, plus your own patterns (`"redact"`). Raw lines stay on
-  the host unless a source is listed in `"raw"`.
-- Logs, commit messages and requests are written by others, attackers
-  included. The reviewer treats them as data: no store credentials, no
-  network for its commands, writes only in its data folder, and asks eaves
-  only from a fixed menu.
-- Logs leave the host only as far as your bucket. Where the model runs is
-  your choice in hobkin's config (Bedrock in-region, for one).
+It also reports where the credentials came from, the clock against S3's, the
+active interpreter, every source (globs, permissions, journald), every
+service's version and the watched files. Then it shows a preview of recent
+lines as templates, with how many values were redacted. Each failure says what
+to change, and the exit code is 1 on any failure.
 
 ## Config
 
+Plumbing only; what to collect is the interpreter's.
+
 | Setting | Default | |
 |---|---|---|
-| `role` | `eave` | `eave`, `ridge` or `local` |
-| `env` | `prod` | the `env=` prefix: one store, several environments |
+| `role` | `eave` | `eave`, `ridge` or `finial` |
+| `env` | `prod` | the `env=` prefix |
 | `host` | hostname | the `host=` prefix |
 | `store` | | a folder, or `s3://bucket/prefix` |
 | `region`, `endpoint` | `$AWS_REGION` | S3 region; an S3-compatible endpoint (path-style) |
-| `state_dir` | `/var/lib/eaveswatch` | offsets, cursors, baselines; the ridge's data default |
+| `state_dir` | `/var/lib/eaveswatch` | offsets, cursors, baselines, the spool; the ridge's data default |
+| `interpreter` | | the interpreter folder; default `RIDGE_DATA/interpreter` for a finial (the reviewer writes it), else `STATE_DIR/interpreter` |
 | `every` | `60` | seconds between ticks |
-| `sources` | `[]` | `{"name", "path": glob}` or `{"name", "journald": true, "units": [...]}`; `"service"` ties a source to one in `services`; `"from_start"` reads a new file from its start |
-| `services` | `{}` | `{"api": {"dir": "/srv/api"}}` (git SHA) or `{"version_file": ...}` |
-| `raw` | `[]` | source names archived as redacted lines |
-| `redact` | `[]` | extra regexes |
-| `spike` | `4.0` | × the usual count (and at least 10) |
-| `warmup_minutes` | `60` | learning time before "new" means anything |
 | `inventory_every` | `3600` | inventory and flows: on change, and at least this often |
-| `spool_max_mb` | `512` | the most an eave keeps waiting for the store before it drops the oldest |
-| `ridge` | | `data` (folder), `envs` (which to read), `silent_after` (seconds), `late_hours` (`24`) and `late_every` (`600` s): the look back for late files |
+| `discover_every` | `3600` | a finial's look at what runs here |
+| `spool_max_mb` | `512` | the most kept waiting for the store |
+| `ridge` | | `data`, `envs`, `silent_after`, `late_hours` (`24`), `late_every` (`600`) |
 
 ## Tests
 
-`python3 tests/test_eaveswatch.py`: the text helpers, the layout, AWS's own
-SigV4 test vector, and a full eave → store → ridge round trip (asks, deploys
-and findings included) on a folder and on a fake S3 that checks every
-signature. No AWS, no cost.
+`python3 tests/test_eaveswatch.py`. No AWS and no cost. It covers:
+- the redaction floor
+- the interpreter: validation, credentials refused, multi-line WebLogic
+  records, levels, timestamps, a catastrophic pattern caught
+- discovery of a real process here: its open log and its port
+- date-rolled logs
+- versions and watched files
+- the layout and AWS's own SigV4 test vector
+- full round trips on a folder, a fake S3 that checks every signature, and a finial
+- the spool through an outage
+- check, the ledger and the chore
