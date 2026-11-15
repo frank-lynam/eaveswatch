@@ -56,7 +56,7 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   command line
 from __future__ import annotations
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 import argparse
 import configparser
@@ -101,7 +101,8 @@ DEFAULTS = {
     "discover_every": 3600,      # a finial looks again at what runs here this often (changes go in the digest)
     "spool_max_mb": 512,         # files wait in STATE_DIR/spool until the store takes them; over this, the oldest go
     "notify": None,              # where alerts and the reviewer's notes go: {"email": ADDR, "sendmail": PATH} or
-                                 # {"email": ADDR, "smtp": "host:port"}; "from", "per_hour" (20). None: kept, not sent
+                                 # {"email": ADDR, "smtp": "host:port"}; "from" (default no-reply@FQDN: one-way),
+                                 # "per_hour" (20). None: kept, not sent
     "publish": None,             # {"dir": PATH}: a folder a web server already serves; the findings page is copied there
     "cluster": None,             # timings for a system of several nodes: lease_seconds, claim_seconds, job_wait_seconds,
                                  # node_gone_seconds, job_keep_days (see CLUSTER)
@@ -2227,21 +2228,29 @@ def alert_body(a: dict) -> str:
     return "\n".join(lines)
 
 
+def mail_from(conf: dict) -> str:
+    """Who notes come from: notify.from, else no-reply at this box's name. Mail is one-way: nothing reads replies."""
+    return conf.get("from") or f"no-reply@{socket.getfqdn()}"
+
+
 def send_mail(conf: dict, subject: str, body: str) -> None:
-    """One email, by sendmail (the box's own mail system) or an SMTP relay. Raises on failure."""
+    """One email, by sendmail (the box's own mail system) or an SMTP relay. One-way: from a no-reply address (the
+    envelope too, so bounces go nowhere a person waits), marked so auto-responders leave it alone. Raises on failure."""
     import email.message
     import smtplib
     msg = email.message.EmailMessage()
-    msg["To"], msg["Subject"] = conf["email"], subject
-    msg["From"] = conf.get("from") or f"eaveswatch@{socket.getfqdn()}"
-    msg.set_content(body)
+    sender = mail_from(conf)
+    msg["To"], msg["Subject"], msg["From"] = conf["email"], subject, sender
+    msg["Auto-Submitted"] = "auto-generated"           # RFC 3834: no out-of-office replies, no loops
+    msg["X-Auto-Response-Suppress"] = "All"
+    msg.set_content(body, cte="8bit")                 # readable as sent (samples are cut well under 998 a line)
     if conf.get("smtp"):
         host, _, port = conf["smtp"].partition(":")
         with smtplib.SMTP(host, int(port or 25), timeout=30) as s:
-            s.send_message(msg)
+            s.send_message(msg, from_addr=sender)
         return
     cmd = conf.get("sendmail") or shutil.which("sendmail") or "/usr/sbin/sendmail"
-    r = subprocess.run([cmd, "-t", "-oi"], input=msg.as_bytes(), capture_output=True, timeout=60)
+    r = subprocess.run([cmd, "-t", "-oi", "-f", sender], input=msg.as_bytes(), capture_output=True, timeout=60)
     if r.returncode:
         raise OSError(f"{cmd} exited {r.returncode}: {r.stderr.decode(errors='replace')[:300]}")
 
@@ -2279,7 +2288,8 @@ def deliver_notes(cfg: dict, once=None) -> tuple[int, int]:
         try:
             send_mail(conf, f"[{tag}] {note['host']}: {note['subject']}",
                       note["body"] + (f"\n\n({waiting} more notes waiting: the hourly cap is {conf.get('per_hour', 20)})"
-                                      if waiting and sent == room - 1 else "") + f"\n\n-- eaveswatch on {note['host']}, {note['at']}")
+                                      if waiting and sent == room - 1 else "") + f"\n\n-- eaveswatch on {note['host']}, {note['at']}\n"
+                      "This address takes no replies: to answer the reviewer, chat with it on that host.")
         except Exception as e:                    # smtplib and sendmail fail in their own ways: hold it, say why
             print(f"eaveswatch: notify: {e}", file=sys.stderr, flush=True)
             break
@@ -2455,7 +2465,8 @@ review what's routed to you, not everything.
    to the journal. Read all of it. Work out what this system *is*.
 2. **Ask your human, once, in one message.** (Started at boot, with nobody in a
    chat? Send the same message with `notify` too, saying how to answer you: by
-   chat with you on this box. Then wait.) This is the one time you wait for an
+   chat with you on this box: email is one-way, replies aren't read. Then wait.)
+   This is the one time you wait for an
    answer before doing the work, because what gets collected leaves this box (for
    the store) and that's theirs to decide. Say what you found in a few lines
    ("a PeopleSoft app server domain HRDEV: PSAPPSRV x3, JOLT on 9000; a PIA
@@ -3015,6 +3026,7 @@ def setup(argv: list[str]) -> None:
     ap.add_argument("--no-chat", action="store_true", help="don't open a chat with the reviewer at the end")
     ap.add_argument("--alert-email", help="where alerts and the reviewer's notes go (asked for if not given)")
     ap.add_argument("--smtp", help="send through this SMTP relay (host:port) instead of the box's sendmail")
+    ap.add_argument("--alert-from", help="the address notes come from (default: no-reply@ this box's name)")
     ap.add_argument("--publish-dir", help="a folder a web server already serves, for the findings page (asked for)")
     ap.add_argument("--system", help="the name instances of this system share (an ASG's), for its saved profile; "
                                      "default: the hostname")
@@ -3062,7 +3074,7 @@ def setup(argv: list[str]) -> None:
         if not email and asking:
             email = input("Where should alerts go? An email address (blank: keep them in the data folder for now): ").strip()
         if email:
-            n = {"email": email}
+            n = {"email": email, **({"from": a.alert_from} if a.alert_from else {})}
             if a.smtp:
                 n["smtp"] = a.smtp
             elif not (shutil.which("sendmail") or os.path.exists("/usr/sbin/sendmail")):
@@ -3771,6 +3783,8 @@ def boot(argv: list[str]) -> None:
                     help="the reviewer harness (default: the system's, else hobkin when a model is given)")
     ap.add_argument("--alert-email", help="where alerts and the reviewer's notes go")
     ap.add_argument("--smtp", help="send through this SMTP relay (host:port) instead of the box's sendmail")
+    ap.add_argument("--alert-from", help="the address notes come from (default: no-reply@ this box's name; replies "
+                                         "aren't read)")
     ap.add_argument("--publish-dir", help="a folder a web server already serves, for the findings page")
     ap.add_argument("--env", help="the env= prefix (default: the system's, else prod)")
     ap.add_argument("--host", help="this node's name (default: its hostname)")
@@ -3787,7 +3801,8 @@ def boot(argv: list[str]) -> None:
     # the flags win: every node of a system boots from the same launch template, so they agree
     sys_cfg.update(role="finial", system=a.system, store=a.store, env=a.env or sys_cfg.get("env") or "prod")
     if a.alert_email:
-        sys_cfg["notify"] = {"email": a.alert_email, **({"smtp": a.smtp} if a.smtp else {})}
+        sys_cfg["notify"] = {"email": a.alert_email, **({"smtp": a.smtp} if a.smtp else {}),
+                             **({"from": a.alert_from} if a.alert_from else {})}
     if a.publish_dir:
         sys_cfg["publish"] = {"dir": a.publish_dir}
     if a.model_url:

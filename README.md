@@ -173,6 +173,8 @@ eaveswatch boot --store s3://my-eaves-bucket/eaveswatch --system ps-hr-app \
   it: the services may still be starting), installs and starts the user
   service, and starts the reviewer with the key you gave and no chat. Running
   it again is safe.
+- `--alert-from ADDR` sets the no-reply address notes come from (default
+  `no-reply@<the box's name>`).
 - `--collector` makes a collector-only node, which shares data but never leads
   or reviews. `--reviewer none` brings your own agent harness. The hobkin
   adapter keeps the key in hobkin's own key file, readable only by that user.
@@ -227,7 +229,12 @@ eaveswatch --config ~/.config/eaveswatch/finial.json service remove   # stop it 
 - **Everything for a person goes through one queue:** fired alerts, the
   reviewer's notes (`eaveswatch notify TEXT`, which works from its sandbox), and
   hobkin's own "I've paused". The loop sends it, at most `per_hour` (20) an
-  hour. With no channel set, notes are kept in `DATA/notify/unsent/`.
+  hour.
+- **Mail is one-way.** Notes come from `no-reply@<this box's name>` (or
+  `--alert-from ADDR`). The envelope sender is the same, so bounces don't go
+  to a person. Auto-responders are told not to reply
+  (`Auto-Submitted: auto-generated`). Each note says how to answer the
+  reviewer: by chat, on its box. With no channel set, notes are kept in `DATA/notify/unsent/`.
   `eaveswatch notify --test` sends one now. SNS is the likely next channel.
 - **The findings page** is rendered by the loop whenever something changes:
   open findings with their evidence, recent alerts, digests, hosts and

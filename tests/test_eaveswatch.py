@@ -650,7 +650,7 @@ alog = os.path.join(ab, "app.log")
 open(alog, "w").close()
 mailbox = os.path.join(ab, "mailbox.txt")
 fake_sendmail = os.path.join(ab, "sendmail")
-open(fake_sendmail, "w").write(f"#!/bin/sh\ncat >> {mailbox}\necho '----' >> {mailbox}\n")
+open(fake_sendmail, "w").write(f"#!/bin/sh\necho \"ARGS: $*\" >> {mailbox}\ncat >> {mailbox}\necho '----' >> {mailbox}\n")
 os.chmod(fake_sendmail, 0o755)
 pub = os.path.join(ab, "www")
 os.makedirs(pub)
@@ -698,6 +698,10 @@ check("[alerts] delivered by sendmail, at most per_hour an hour (the rest wait, 
       sent == 3 and left == 0 and mail.count("----") == 3 and "Subject: [ALERT] ps1: db-down" in mail and "To: me@example.test" in mail,
       (sent, left, mail[:600]))
 ew.queue_note(acfg, "one more", "x")
+check("[alerts] mail is one-way: from no-reply (the envelope too: bounces go nowhere), auto-responders told off, and it says how to answer",
+      re.search(r"^From: no-reply@\S+$", mail, re.M) and re.search(r"^ARGS: -t -oi -f no-reply@\S+$", mail, re.M)
+      and "Auto-Submitted: auto-generated" in mail and "X-Auto-Response-Suppress: All" in mail
+      and "This address takes no replies: to answer the reviewer, chat with it on that host." in mail, mail[:900])
 check("[alerts] over the hourly cap, a note waits in the queue", ew.deliver_notes(acfg) == (0, 1) and len(q()) == 1)
 d_alerts = ar.watch()
 check("[alerts] the digest starts with what fired (already sent: follow up), and keeps them for the page",
@@ -943,12 +947,13 @@ check("[boot] a reviewer without its key: it says which flag", jr_nokey.returnco
 newstore = os.path.join(cb, "new-store")
 nb_home = tempfile.mkdtemp()
 jr_new = boot(nb_home, "--store", newstore, "--system", "fresh", "--model-url", "https://api.example.test/v1", "--model", "m2",
-              "--model-key", "sk-never-shared-9f3", "--alert-email", "ops@example.test", "--smtp", f"127.0.0.1:{smtp.server_address[1]}",
+              "--model-key", "sk-never-shared-9f3", "--alert-email", "ops@example.test", "--alert-from", "noreply@ps.example.test", "--smtp", f"127.0.0.1:{smtp.server_address[1]}",
               "--publish-dir", nb_home, "--no-service")
 fresh = ew.jget(ew.FolderStore(newstore), "systems/system=fresh/config.json")[0] or {}
 check("[boot] no such system yet: created from the flags (model API, alerts, findings page) and shared, never the key",
       "created system fresh" in jr_new.stdout and fresh.get("reviewer", {}).get("model") == "m2"
       and fresh["config"]["notify"]["email"] == "ops@example.test" and fresh["config"]["publish"]["dir"] == nb_home
+      and fresh["config"]["notify"]["from"] == "noreply@ps.example.test"
       and "sk-never-shared-9f3" not in json.dumps(fresh)
       and not any("sk-never-shared-9f3" in ew.FolderStore(newstore).get(k).decode(errors="replace")
                   for k in ew.FolderStore(newstore).list("")), jr_new.stdout + jr_new.stderr)
