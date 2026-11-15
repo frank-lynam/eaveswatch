@@ -698,13 +698,13 @@ check("[alerts] delivered by sendmail, at most per_hour an hour (the rest wait, 
       sent == 3 and left == 0 and mail.count("----") == 3 and "Subject: [ALERT] ps1: db-down" in mail and "To: me@example.test" in mail,
       (sent, left, mail[:600]))
 ew.queue_note(acfg, "one more", "x")
-import email
+import email, email.policy
 first_args, first_raw = mail.split("\n", 1)[0], mail.split("\n", 1)[1].split("----\n")[0]
-first = email.message_from_string(first_raw)       # parsed: a long host name folds the From header, as it may
+first = email.message_from_string(first_raw, policy=email.policy.default)   # unfolds a long host's From header
 check("[alerts] mail is one-way: from no-reply (the envelope too: bounces go nowhere), auto-responders told off, and it says how to answer",
       first["From"].startswith("no-reply@") and first_args == f"ARGS: -t -oi -f {first['From']}"
       and first["Auto-Submitted"] == "auto-generated" and first["X-Auto-Response-Suppress"] == "All"
-      and "This address takes no replies: to answer the reviewer, chat with it on that host." in first.get_payload(),
+      and "This address takes no replies: to answer the reviewer, chat with it on that host." in first.get_content(),
       (first_args, dict(first.items())))
 check("[alerts] over the hourly cap, a note waits in the queue", ew.deliver_notes(acfg) == (0, 1) and len(q()) == 1)
 d_alerts = ar.watch()
