@@ -56,7 +56,7 @@ Config (--config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json) is plumbing o
 #   command line
 from __future__ import annotations
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 import argparse
 import configparser
