@@ -39,6 +39,8 @@ def spec_file(spec, where):
 r = ew.redactor([r"cust-\d{6}"])
 for raw, want in [("GET /x?token=abc123&u=1", "GET /x?token=<redacted>&u=1"),
                   ('password="hunter2" ok', 'password="<redacted>" ok'),
+                  ("db_password=abc123 jdbc.password: x9", "db_password=<redacted> jdbc.password: <redacted>"),
+                  ("password_policy_min_length = 8", "password_policy_min_length = 8"),
                   ("key AKIAABCDEFGHIJKLMNOP here", "key <redacted> here"),
                   ("https://bob:pw@db.local/x", "https://bob:<redacted>@db.local/x"),
                   ("api_key: sk-live-123 for cust-123456", "api_key: <redacted> for <redacted>"),

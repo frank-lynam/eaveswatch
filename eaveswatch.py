@@ -445,8 +445,8 @@ REDACT = [
     (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "<redacted>"),                                 # AWS access key ids
     (r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}", "<redacted>"),                          # JWTs
     (r"(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}", r"\1 <redacted>"),                     # Authorization: Bearer ...
-    (r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|session[_-]?id|"
-     r"aws_secret_access_key|authorization|ps_token|ps_tokenexpire|jsessionid|ps_lastsite|[\w-]*sessionid)"
+    (r"(?i)(\b[\w.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|session[_-]?id|"
+     r"aws_secret_access_key|authorization|ps_token|ps_tokenexpire|jsessionid|ps_lastsite|[\w-]*sessionid))"
      r"([\"']?\s*[:=]\s*[\"']?)(?!<redacted)[^\s&\"',;]+", r"\1\2<redacted>"),
     (r"(://[^/\s:@]+):[^/\s@]+@", r"\1:<redacted>@"),                                 # user:pass@ in URLs
     (r"(?<![\w/+=])[A-Za-z0-9+/]{40,}={0,2}(?![\w/+=])", "<redacted blob>"),          # long base64: keys, tokens
