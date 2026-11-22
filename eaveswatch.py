@@ -3865,38 +3865,80 @@ def loop(cfg: dict, once: bool, *steps) -> None:
         time.sleep(max(int(cfg["every"]), 5))
 
 
+class HelpFormat(argparse.RawDescriptionHelpFormatter):
+    """--help laid out the way hobkin, lorewell, eaveswatch, atone and hearthboard all do it: a short usage line,
+    then each command and option on one line with what it does (argparse's {a,b,c} list of choices left out)."""
+
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=26, width=min(100, shutil.get_terminal_size((100, 24)).columns))
+
+    def _format_action(self, action):
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(self._format_action(a) for a in action._get_subactions())
+        return super()._format_action(action)
+
+    @classmethod
+    def everywhere(cls, parser, prog=None):
+        """This layout for a parser and all its commands, at every level: commands shown as COMMAND, and listed
+        under "commands" (or "arguments", where there are others too)."""
+        parser.formatter_class = cls
+        subs = [a for a in parser._positionals._group_actions if isinstance(a, argparse._SubParsersAction)]
+        for action in subs:
+            action.metavar = action.metavar or "COMMAND"
+            for each in action.choices.values():
+                cls.everywhere(each)
+        if subs:
+            parser._positionals.title = "commands" if len(subs) == len(parser._positionals._group_actions) else "arguments"
+        return parser
+
+
 def cli(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(prog="eaveswatch", description=__doc__.split("\n")[0])
-    ap.add_argument("--config")
-    ap.add_argument("--version", action="version", version=__version__)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("eave", "finial"):
-        s = sub.add_parser(name)
-        s.add_argument("--once", action="store_true")
-    r = sub.add_parser("ridge")
+    ap = argparse.ArgumentParser(
+        prog="eaveswatch", usage="eaveswatch COMMAND [options]   or   eaveswatch URL MODEL [KEY]",
+        description="eaveswatch: logs, inventory and connections from every host, interpreted and reviewed by an AI\n"
+                    "agent (designed for hobkin; any harness that meets `eaveswatch reviewer contract` can review).\n"
+                    "What to collect and how to read it is the interpreter spec: patterns written by the reviewer,\n"
+                    "run by plain code on every line. Secrets are redacted first, always.",
+        epilog="examples:\n"
+               "  eaveswatch URL MODEL [KEY]             set this box up as a finial and start its reviewer\n"
+               "  eaveswatch boot --store S --system N   every boot, every node: join the system, or create it\n"
+               "  eaveswatch check                       is this set up right?\n"
+               "  eaveswatch finding list                the open findings\n\n"
+               "Config: --config, else $EAVESWATCH_CONFIG, else ./eaveswatch.json. eaveswatch COMMAND --help:\n"
+               "that command's options. More: https://github.com/frank-lynam/eaveswatch")
+    ap.add_argument("--config", help="the config file (plumbing only: role, store, folders)")
+    ap.add_argument("--version", action="version", version=__version__, help="show the version and exit")
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="COMMAND", prog="eaveswatch")
+    sub.add_parser("setup", help="URL MODEL [KEY]: set this box up as a finial and start its reviewer, in one go")
+    sub.add_parser("boot", help="--store S --system N ...: every boot, join the system or create it, all by flag")
+    for name, about in (("eave", "on a host: logs to templates and counts, inventory, flows; spooled, then sent"),
+                        ("finial", "one box, all of it: eave, ridge and reviewer together")):
+        s = sub.add_parser(name, help=about)
+        s.add_argument("--once", action="store_true", help="one pass, then exit")
+    r = sub.add_parser("ridge", help="the hub's loop (no model): new files from the store; watch: what's new")
     r.add_argument("action", nargs="?", choices=("sync", "watch"))
-    r.add_argument("--once", action="store_true")
-    d = sub.add_parser("discover")
+    r.add_argument("--once", action="store_true", help="one pass, then exit")
+    d = sub.add_parser("discover", help="what runs here: services, processes, the logs they write, ports, configs")
     d.add_argument("--json", action="store_true")
-    i = sub.add_parser("interpret")
+    i = sub.add_parser("interpret", help="init|test|apply|rollback|show the interpreter spec (written by the reviewer)")
     i.add_argument("action", choices=("init", "test", "apply", "rollback", "show", "_replay"))
     i.add_argument("file", nargs="?")
     i.add_argument("--note")
     i.add_argument("--force", action="store_true")
-    a = sub.add_parser("ask")
+    a = sub.add_parser("ask", help="HOST lines FP | inventory | flows: ask an eave for log lines or fresh data")
     a.add_argument("host")
     a.add_argument("what", choices=("lines", "inventory", "flows"))
     a.add_argument("fp", nargs="?")
     a.add_argument("--source")
     a.add_argument("--limit", type=int)
     a.add_argument("--env")
-    f = sub.add_parser("finding")
+    f = sub.add_parser("finding", help="add < finding.json | list [--all] | status ID STATUS [--why]")
     f.add_argument("action", choices=("add", "list", "status"))
     f.add_argument("id", nargs="?")
     f.add_argument("status", nargs="?")
     f.add_argument("--why")
     f.add_argument("--all", action="store_true")
-    sub.add_parser("check")
+    sub.add_parser("check", help="is this set up right? store, credentials, clock, interpreter, sources")
     sv = sub.add_parser("service", help="this config as a systemd user service of whoever runs it: add, remove, status")
     sv.add_argument("action", choices=("add", "remove", "status"))
     sv.add_argument("--force", action="store_true", help="add: replace a unit that runs another eaveswatch or config")
@@ -3905,7 +3947,7 @@ def cli(argv: list[str] | None = None) -> None:
     jb.add_argument("action", choices=("done", "release", "list"))
     jb.add_argument("id", nargs="?")
     jb.add_argument("--note")
-    nt = sub.add_parser("notify")
+    nt = sub.add_parser("notify", help="TEXT: a note for the person (queued; --test sends one now)")
     nt.add_argument("text", nargs="*")
     nt.add_argument("--subject")
     nt.add_argument("--severity", choices=("page", "warn"), default="warn")
@@ -3916,7 +3958,7 @@ def cli(argv: list[str] | None = None) -> None:
     rv.add_argument("--dest")
     rv.add_argument("--repos")
     rv.add_argument("--force", action="store_true")
-    k = sub.add_parser("key")
+    k = sub.add_parser("key", help="KIND [HOST]: where a file of KIND from HOST would go now (to check a layout)")
     k.add_argument("kind", choices=KINDS)
     k.add_argument("host", nargs="?")
     argv = sys.argv[1:] if argv is None else argv
@@ -3924,7 +3966,7 @@ def cli(argv: list[str] | None = None) -> None:
         return setup(argv[1:] if argv[0] == "setup" else argv)
     if argv and argv[0] == "boot":                     # every boot, every node: join the system, or create it
         return boot(argv[1:])
-    args = ap.parse_args(argv)
+    args = HelpFormat.everywhere(ap).parse_args(argv)
     if args.cmd == "reviewer" and args.action == "install":     # needs no config
         if not args.adapter:
             sys.exit(f"eaveswatch: reviewer install ADAPTER ({', '.join(sorted(REVIEWERS))})")
